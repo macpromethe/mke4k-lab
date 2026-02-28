@@ -1,0 +1,44 @@
+# ============================================================
+#  mke4k-lab -- cluster configuration
+#  Edit this file, then run:  t deploy lab
+# ============================================================
+
+# -- Cluster identity ----------------------------------------
+# Name prefix used for all AWS resources (EC2, SG, NLB, IAM).
+# Keep it short, lowercase, no spaces.
+cluster_name="mke4k-lab"
+
+# -- Node counts ---------------------------------------------
+# For HA control plane use 3 controllers (must be an odd number).
+# Workers run your workloads.
+controller_count=1
+worker_count=1
+
+# -- Instance sizing -----------------------------------------
+# All nodes use the same EC2 instance type.
+# Minimum recommended: m5.xlarge (4 vCPU / 16 GB RAM).
+cluster_flavor="m5.xlarge"
+
+# -- AWS region ----------------------------------------------
+# Region to deploy into. Must match your credentials scope.
+region="eu-central-1"
+
+# -- MKE 4k version ------------------------------------------
+# mkectl is downloaded automatically at this version on first use.
+# Releases: https://github.com/MirantisContainers/mke-release/releases
+mke4k_version="v4.1.2"
+
+# -- Operating system ----------------------------------------
+# Ubuntu version for all EC2 nodes.
+# Supported values: ubuntu-22.04  |  ubuntu-24.04
+os_distro="ubuntu-22.04"
+
+# -- AWS Cloud Controller Manager (CCM) ----------------------
+# true  -> IAM role + policy created; CCM enabled in mke4.yaml.
+#          Required for LoadBalancer services and EBS volumes.
+# false -> no IAM resources; cloudProvider disabled in mke4.yaml.
+ccm_enabled=true
+
+# -- Debug mode ----------------------------------------------
+# true -> mkectl runs with -l debug (very verbose output).
+debug=false

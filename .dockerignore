@@ -1,0 +1,10 @@
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/aws_private.pem
+terraform/mke4.yaml
+.DS_Store
+.git
+.gitignore
+.vscode
