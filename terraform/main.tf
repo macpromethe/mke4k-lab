@@ -151,6 +151,15 @@ resource "aws_security_group" "cluster_allow_ssh" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # MKE3 UI / HTTPS (from MKE3 NLB)
+  ingress {
+    description = "MKE3 UI / HTTPS"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   # Intra-cluster: all traffic within the security group
   ingress {
     description = "Intra-cluster"

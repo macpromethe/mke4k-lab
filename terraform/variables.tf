@@ -43,3 +43,9 @@ variable "os_distro" {
     error_message = "os_distro must be 'ubuntu-22.04' or 'ubuntu-24.04'."
   }
 }
+
+variable "mke3_enabled" {
+  type        = bool
+  default     = false
+  description = "When true, provision a second NLB for MKE3 alongside the MKE4k NLB"
+}

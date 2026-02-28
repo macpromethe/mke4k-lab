@@ -4,6 +4,7 @@ terraform/.terraform/
 terraform/.terraform.lock.hcl
 terraform/aws_private.pem
 terraform/mke4.yaml
+mke3/
 .DS_Store
 .git
 .gitignore

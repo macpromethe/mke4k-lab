@@ -22,3 +22,8 @@ output "mkectl_command" {
   description = "Ready-to-run mkectl apply command"
   value       = "mkectl apply -f ${abspath("${path.module}/mke4.yaml")}"
 }
+
+output "mke3_lb_dns_name" {
+  description = "MKE3 NLB DNS name (used as --san in launchpad.yaml)"
+  value       = var.mke3_enabled ? aws_lb.mke3[0].dns_name : ""
+}

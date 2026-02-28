@@ -23,11 +23,6 @@ cluster_flavor="m5.xlarge"
 # Region to deploy into. Must match your credentials scope.
 region="eu-central-1"
 
-# -- MKE 4k version ------------------------------------------
-# mkectl is downloaded automatically at this version on first use.
-# Releases: https://github.com/MirantisContainers/mke-release/releases
-mke4k_version="v4.1.2"
-
 # -- Operating system ----------------------------------------
 # Ubuntu version for all EC2 nodes.
 # Supported values: ubuntu-22.04  |  ubuntu-24.04
@@ -42,3 +37,28 @@ ccm_enabled=true
 # -- Debug mode ----------------------------------------------
 # true -> mkectl runs with -l debug (very verbose output).
 debug=false
+
+# ============================================================
+#  MKE4k settings  (t deploy lab / t deploy lab mke4)
+# ============================================================
+# mkectl is downloaded automatically at this version on first use.
+# Releases: https://github.com/MirantisContainers/mke-release/releases
+mke4k_version="v4.1.2"
+
+# ============================================================
+#  MKE3 settings   (t deploy lab mke3)
+# ============================================================
+# launchpad binary is downloaded automatically on first use.
+# Releases: https://github.com/Mirantis/launchpad/releases
+launchpad_version="1.5.15"
+
+mke3_version="3.8.2"
+mcr_version="25.0.14"
+# NOTE: As of launchpad 1.5.15, channel must match mcr_version exactly.
+# Pattern: stable-<major>.<minor>.<patch>  e.g. stable-25.0.14 for mcr_version 25.0.14
+mcr_channel="stable-25.0.14"
+
+# Admin username for the MKE3 UI.
+# The password is auto-generated on first deploy and saved to
+# terraform/mke3_credentials.txt — printed in the deploy summary.
+mke3_admin_username="admin"
