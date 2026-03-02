@@ -5,8 +5,17 @@ terraform/.terraform/
 terraform/.terraform.lock.hcl
 terraform/aws_private.pem
 terraform/mke4.yaml
+terraform/terraform.tfvars
+terraform/mke3_credentials.txt
+terraform/registry_credentials.txt
+terraform/registry_ca.crt
+terraform/launchpad.yaml
+terraform/nodes.yaml
 mke3/
 .DS_Store
 .git
 .gitignore
 .vscode
+CLAUDE.md
+README.md
+bin/cleanup-aws.sh
