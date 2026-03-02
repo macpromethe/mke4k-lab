@@ -49,3 +49,21 @@ variable "mke3_enabled" {
   default     = false
   description = "When true, provision a second NLB for MKE3 alongside the MKE4k NLB"
 }
+
+variable "airgap_enabled" {
+  type        = bool
+  default     = false
+  description = "When true, create bastion/registry host and private subnet for cluster nodes"
+}
+
+variable "airgap_registry_flavor" {
+  type        = string
+  default     = "t3.xlarge"
+  description = "EC2 instance type for the bastion/registry host"
+}
+
+variable "airgap_registry_disk_gb" {
+  type        = number
+  default     = 100
+  description = "Root volume size in GB for the bastion/registry host"
+}

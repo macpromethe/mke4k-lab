@@ -27,3 +27,23 @@ output "mke3_lb_dns_name" {
   description = "MKE3 NLB DNS name (used as --san in launchpad.yaml)"
   value       = var.mke3_enabled ? aws_lb.mke3[0].dns_name : ""
 }
+
+output "bastion_public_ip" {
+  description = "Bastion/registry host public IP"
+  value       = var.airgap_enabled ? aws_instance.bastion[0].public_ip : ""
+}
+
+output "bastion_private_ip" {
+  description = "Bastion/registry host private IP (used as registry address)"
+  value       = var.airgap_enabled ? aws_instance.bastion[0].private_ip : ""
+}
+
+output "controller_private_ips" {
+  description = "Private IP addresses of controller nodes"
+  value       = aws_instance.cluster-controller[*].private_ip
+}
+
+output "worker_private_ips" {
+  description = "Private IP addresses of worker nodes"
+  value       = aws_instance.cluster-workers[*].private_ip
+}

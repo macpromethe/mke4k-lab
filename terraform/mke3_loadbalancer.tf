@@ -9,7 +9,7 @@ resource "aws_security_group" "mke3_nlb" {
   count       = var.mke3_enabled ? 1 : 0
   name        = "${var.cluster_name}-mke3-nlb-sg"
   description = "MKE3 NLB - inbound on 443 and 6443, outbound to cluster nodes"
-  vpc_id      = data.aws_vpc.default.id
+  vpc_id      = aws_vpc.lab.id
 
   ingress {
     description = "MKE3 UI / HTTPS"
@@ -57,7 +57,7 @@ resource "aws_lb" "mke3" {
   name               = "${var.cluster_name}-mke3-nlb"
   internal           = false
   load_balancer_type = "network"
-  subnets            = data.aws_subnets.default.ids
+  subnets            = [aws_subnet.public.id]
   security_groups    = [aws_security_group.mke3_nlb[0].id]
 
   tags = {
@@ -70,11 +70,12 @@ resource "aws_lb" "mke3" {
 # Target Groups
 # ---------------------------------------------------------------------------
 resource "aws_lb_target_group" "mke3_mke" {
-  count    = var.mke3_enabled ? 1 : 0
-  name     = "${var.cluster_name}-mke3-mke"
-  port     = 443
-  protocol = "TCP"
-  vpc_id   = data.aws_vpc.default.id
+  count       = var.mke3_enabled ? 1 : 0
+  name        = "${var.cluster_name}-mke3-mke"
+  port        = 443
+  protocol    = "TCP"
+  target_type = "ip"
+  vpc_id      = aws_vpc.lab.id
 
   health_check {
     protocol            = "TCP"
@@ -91,11 +92,12 @@ resource "aws_lb_target_group" "mke3_mke" {
 }
 
 resource "aws_lb_target_group" "mke3_kube" {
-  count    = var.mke3_enabled ? 1 : 0
-  name     = "${var.cluster_name}-mke3-kube"
-  port     = 6443
-  protocol = "TCP"
-  vpc_id   = data.aws_vpc.default.id
+  count       = var.mke3_enabled ? 1 : 0
+  name        = "${var.cluster_name}-mke3-kube"
+  port        = 6443
+  protocol    = "TCP"
+  target_type = "ip"
+  vpc_id      = aws_vpc.lab.id
 
   health_check {
     protocol            = "TCP"
@@ -144,13 +146,13 @@ resource "aws_lb_listener" "mke3_kube" {
 resource "aws_lb_target_group_attachment" "mke3_mke" {
   count            = var.mke3_enabled ? var.controller_count : 0
   target_group_arn = aws_lb_target_group.mke3_mke[0].arn
-  target_id        = aws_instance.cluster-controller[count.index].id
+  target_id        = aws_instance.cluster-controller[count.index].private_ip
   port             = 443
 }
 
 resource "aws_lb_target_group_attachment" "mke3_kube" {
   count            = var.mke3_enabled ? var.controller_count : 0
   target_group_arn = aws_lb_target_group.mke3_kube[0].arn
-  target_id        = aws_instance.cluster-controller[count.index].id
+  target_id        = aws_instance.cluster-controller[count.index].private_ip
   port             = 6443
 }

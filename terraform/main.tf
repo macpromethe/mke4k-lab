@@ -77,34 +77,12 @@ data "aws_ami" "ubuntu" {
 }
 
 # ---------------------------------------------------------------------------
-# Networking — default VPC + subnets
-# ---------------------------------------------------------------------------
-data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
-}
-
-# Tag default subnets so the CCM can discover them for ELB provisioning
-resource "aws_ec2_tag" "subnet_cluster" {
-  for_each    = toset(data.aws_subnets.default.ids)
-  resource_id = each.value
-  key         = "kubernetes.io/cluster/${var.cluster_name}"
-  value       = "shared"
-}
-
-# ---------------------------------------------------------------------------
 # Security group
 # ---------------------------------------------------------------------------
 resource "aws_security_group" "cluster_allow_ssh" {
   name        = "${var.cluster_name}-sg"
   description = "MKE4k cluster security group"
-  vpc_id      = data.aws_vpc.default.id
+  vpc_id      = aws_vpc.lab.id
 
   # SSH
   ingress {

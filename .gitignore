@@ -1,0 +1,14 @@
+.cluster-id
+.DS_Store
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/aws_private.pem
+terraform/mke4.yaml
+terraform/mke3_credentials.txt
+terraform/registry_credentials.txt
+terraform/registry_ca.crt
+terraform/launchpad.yaml
+terraform/nodes.yaml
+terraform/terraform.tfvars

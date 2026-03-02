@@ -1,8 +1,8 @@
 # mke4k-lab
 
-A standalone AWS lab provisioning tool for [Mirantis Kubernetes Engine 4k](https://www.mirantis.com/software/mke-4/).
+A standalone AWS lab provisioning tool for [Mirantis Kubernetes Engine 4k](https://www.mirantis.com/software/mke-4/) and MKE3.
 
-Terraform provisions EC2 instances + NLB + IAM role; `mkectl apply` installs MKE4k.
+Terraform provisions a dedicated VPC, EC2 instances, NLB, and IAM role; `mkectl apply` / `launchpad apply` installs the product. Supports three deployment modes: **MKE4k** (default), **MKE3** (for upgrade testing), and **Airgap** (true network isolation with a private registry).
 
 ## Quick Start
 
@@ -17,12 +17,21 @@ docker run -it --name mke4k-lab \
   -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
   -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
   mke4k-lab
+
+# For airgap deployments, add port mappings for UI tunnels
+docker run -it --name mke4k-lab \
+  -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+  -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+  -p 3000:3000 -p 8443:8443 \
+  mke4k-lab
 ```
 
 Once inside the container:
 ```bash
 vi /mke4k-lab/config      # edit cluster settings
-t deploy lab              # provision EC2 + NLB, then install MKE4k
+t deploy lab              # MKE4k: provision EC2 + NLB, then install
+t deploy lab mke3         # MKE3:  provision + launchpad apply
+t deploy lab airgap       # Airgap: bastion + registry + MKE4k (no internet on nodes)
 t show nodes              # print IPs
 t destroy lab             # teardown
 ```
@@ -46,7 +55,7 @@ docker cp mke4k-lab:/mke4k-lab/terraform/terraform.tfstate .
 - `terraform` >= 0.14.3
 - `mkectl`
 - `kubectl`
-- `jq`
+- `jq`, `yq`
 
 ### 1. Edit config
 
@@ -55,13 +64,13 @@ vi config
 ```
 
 ```bash
-cluster_name="mke4k-lab"
+cluster_name="mke4k-lab"       # auto-suffixed with random 4-char ID (e.g. mke4k-lab-a3f2)
 controller_count=1
 worker_count=1
 cluster_flavor="m5.xlarge"
-region="us-east-1"
+region="eu-central-1"
 mke4k_version="v4.1.2"
-os_distro="ubuntu-22.04"    # ubuntu-22.04 or ubuntu-24.04
+os_distro="ubuntu-22.04"       # ubuntu-22.04 or ubuntu-24.04
 ```
 
 ### 2. Export AWS credentials
@@ -78,77 +87,233 @@ export AWS_SECRET_ACCESS_KEY="..."
 ```
 
 This will:
-1. Run `terraform init` + `terraform apply` (provisions EC2 + NLB + IAM)
+1. Run `terraform init` + `terraform apply` (provisions dedicated VPC + EC2 + NLB + IAM)
 2. Generate `terraform/mke4.yaml` from the provisioned infrastructure
 3. Run `mkectl apply -f terraform/mke4.yaml`
 
 ## CLI Commands
 
+### MKE4k (default)
+
 | Command | Description |
 |---|---|
-| `./bin/t deploy lab` | Full deployment: instances + MKE4k cluster |
-| `./bin/t deploy instances` | Terraform only (provision infrastructure) |
-| `./bin/t deploy cluster` | mkectl only (install MKE4k on existing instances) |
-| `./bin/t destroy lab` | Teardown: mkectl delete + terraform destroy |
-| `./bin/t status` | Show cluster node status (`kubectl get nodes`) |
-| `./bin/t show nodes` | Print IPs and NLB DNS name |
+| `t deploy lab` | Full deployment: Terraform + mkectl apply |
+| `t deploy instances` | Terraform only (provision infrastructure) |
+| `t deploy cluster` | mkectl only (install MKE4k on existing instances) |
+| `t destroy cluster` | Uninstall MKE4k (mkectl reset --force) |
+| `t destroy lab` | Teardown all AWS infrastructure (terraform destroy) |
+
+### MKE3
+
+| Command | Description |
+|---|---|
+| `t deploy lab mke3` | Full: Terraform (both NLBs) + launchpad apply |
+| `t deploy instances mke3` | Terraform with MKE3 NLB enabled |
+| `t deploy cluster mke3` | launchpad apply on existing instances |
+| `t destroy cluster mke3` | Uninstall MKE3 (launchpad reset --force) |
+
+### Airgap
+
+| Command | Description |
+|---|---|
+| `t deploy lab airgap` | Full: Terraform + registry setup + bundle upload + mkectl (from bastion) |
+| `t deploy instances airgap` | Terraform only (bastion + private-subnet nodes) |
+| `t deploy registry` | Setup MSR4 on bastion + download & upload MKE4k bundle |
+| `t deploy cluster airgap` | mkectl apply from bastion (registry must exist) |
+| `t destroy cluster airgap` | Uninstall MKE4k from bastion (mkectl reset) |
+| `t tunnel` | Show available SSH tunnels with manual commands |
+| `t tunnel dashboard` | MKE4k Dashboard tunnel -> https://localhost:3000 |
+| `t tunnel registry` | Harbor Registry tunnel -> https://localhost:8443 |
+
+### General
+
+| Command | Description |
+|---|---|
+| `t status` | Show cluster node status (`kubectl get nodes`) |
+| `t show nodes` | Print IPs and NLB DNS name |
+| `t connect bastion` | SSH to bastion/registry host (airgap only) |
+| `t connect m1` | SSH to controller-1 (via ProxyCommand when airgap) |
+| `t connect w1` | SSH to worker-1 |
+| `t connect <node> "cmd"` | Run a single command on a node |
 
 ## Project Structure
 
 ```
 mke4k-lab/
-├── config                   # User-edited config (edit this)
+├── config                        # User-edited config (edit this)
 ├── bin/
-│   ├── t                    # Thin launcher
-│   └── t-commandline.bash   # CLI implementation
+│   ├── t                         # Thin launcher
+│   ├── t-commandline.bash        # CLI implementation
+│   └── cleanup-aws.sh            # Emergency AWS cleanup (when state is lost)
 └── terraform/
-    ├── main.tf              # Provider, SG, keypair, AMI lookup, mke4.yaml
-    ├── variables.tf         # Variable declarations
-    ├── controller.tf        # Controller EC2 instances
-    ├── worker.tf            # Worker EC2 instances
-    ├── loadbalancer.tf      # NLB + target groups + listeners
-    ├── iam.tf               # IAM role + CCM policy + instance profile
-    └── outputs.tf           # lb_dns_name, IPs, ssh key path
+    ├── vpc.tf                    # Dedicated VPC, IGW, public subnet, route table
+    ├── main.tf                   # Provider, SG, keypair, AMI lookup
+    ├── variables.tf              # Variable declarations
+    ├── controller.tf             # Controller EC2 instances
+    ├── worker.tf                 # Worker EC2 instances
+    ├── loadbalancer.tf           # MKE4k NLB + IP-type target groups + listeners
+    ├── mke3_loadbalancer.tf      # MKE3 NLB (conditional on mke3_enabled)
+    ├── airgap.tf                 # Bastion + private subnet (conditional on airgap_enabled)
+    ├── iam.tf                    # IAM role + CCM policy + instance profile
+    └── outputs.tf                # lb_dns_name, IPs, ssh key path, bastion IPs
 ```
 
 ## What Terraform Creates
 
+### Always created
+
 | Resource | Details |
 |---|---|
+| `aws_vpc` + `aws_internet_gateway` | Dedicated VPC (`172.31.0.0/16`) with IGW — full isolation per lab |
+| `aws_subnet` (public) | `172.31.0.0/24` with `map_public_ip_on_launch` |
 | `tls_private_key` + `aws_key_pair` | RSA-4096 key pair, PEM saved to `terraform/aws_private.pem` |
-| `aws_security_group` | Ports 22, 6443, 9443, 33001, 30080 + intra-cluster |
-| `aws_instance` (controllers) | Ubuntu, `m5.xlarge` (configurable), 50GB gp3, CCM instance profile |
+| `aws_security_group` | Ports 22, 443, 6443, 9443, 33001, 30080 + intra-cluster |
+| `aws_instance` (controllers) | Ubuntu, `m5.xlarge` (configurable), 50GB gp3 |
 | `aws_instance` (workers) | Same as controllers |
-| `aws_lb` (NLB) | Public, multi-AZ across default VPC subnets |
-| `aws_lb_target_group` x3 | kube-api (6443), controller-join (9443), ingress (33001) |
-| `aws_iam_role` + `aws_iam_policy` | AWS CCM minimum permissions |
-| `aws_iam_instance_profile` | Attached to all EC2 instances |
+| `aws_lb` (NLB) | Public NLB in public subnet (internal in airgap) |
+| `aws_lb_target_group` x3 | kube-api (6443), controller-join (9443), ingress (33001) — all **IP-type** |
+| `aws_iam_role` + `aws_iam_policy` | AWS CCM minimum permissions (when `ccm_enabled`, auto-disabled in airgap) |
+| `aws_iam_instance_profile` | Attached to all EC2 instances (when `ccm_enabled`) |
+
+### MKE3 mode (`mke3_enabled`)
+
+| Resource | Details |
+|---|---|
+| `aws_lb` (MKE3 NLB) | Second NLB for MKE3 UI (443) + API (6443) — IP-type targets |
+
+### Airgap mode (`airgap_enabled`)
+
+| Resource | Details |
+|---|---|
+| `aws_subnet` (private) | `172.31.1.0/24`, no IGW route — true network isolation |
+| `aws_route_table` | Only local VPC routing (no internet) |
+| `aws_instance` (bastion) | Public subnet, configurable size, runs MSR4 (Harbor) |
+| `aws_lb` (NLB) | Switched to **internal**, placed in private subnet |
+| Controllers + workers | Placed in the private subnet (no public IPs), CCM auto-disabled |
 
 ## After Deployment
 
 ```bash
 # Check node status
-./bin/t status
+t status
 
 # SSH to a controller
-./bin/t show nodes
-ssh -i terraform/aws_private.pem ubuntu/<controller-ip>
+t connect m1
 
 # Use kubectl directly
 kubectl --kubeconfig ~/.mke/mke.kubeconf get nodes
 
+# Airgap: access MKE Dashboard (requires -p 3000:3000 on docker run)
+t tunnel dashboard
+# then browse https://localhost:3000
+
+# Airgap: access Harbor UI (requires -p 8443:8443 on docker run)
+t tunnel registry
+# then browse https://localhost:8443
+
 # Teardown
-./bin/t destroy lab
+t destroy lab
 ```
 
 ## Configuration Reference
 
+### Shared infrastructure
+
 | Variable | Default | Description |
 |---|---|---|
-| `cluster_name` | `mke4k-lab` | Name prefix for all resources |
-| `controller_count` | `1` | Number of controller nodes |
+| `cluster_name` | `mke4k-lab` | Name prefix for all resources. Left as default, a random 4-char suffix is auto-appended (e.g. `mke4k-lab-a3f2`) to avoid collisions between users. Persisted in `.cluster-id` |
+| `controller_count` | `1` | Number of controller nodes (use 3 for HA) |
 | `worker_count` | `1` | Number of worker nodes |
 | `cluster_flavor` | `m5.xlarge` | EC2 instance type |
-| `region` | `us-east-1` | AWS region |
-| `mke4k_version` | `v4.1.2` | MKE4k version to install |
+| `region` | `eu-central-1` | AWS region |
 | `os_distro` | `ubuntu-22.04` | OS: `ubuntu-22.04` or `ubuntu-24.04` |
+| `ccm_enabled` | `true` | Creates IAM role; required for LoadBalancer services. Auto-disabled in airgap |
+| `debug` | `false` | `true` adds `-l debug` to mkectl (all modes including airgap) |
+
+### MKE4k settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `mke4k_version` | `v4.1.2` | MKE4k / mkectl version |
+
+### MKE3 settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `launchpad_version` | `1.5.15` | Launchpad binary version (no `v` prefix) |
+| `mke3_version` | `3.8.2` | MKE3 version |
+| `mcr_version` | `25.0.14` | MCR (Docker engine) version |
+| `mcr_channel` | `stable-25.0.14` | Must match `mcr_version` exactly |
+| `mke3_admin_username` | `admin` | MKE3 UI admin user |
+
+### Airgap settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `airgap_registry_flavor` | `t3.xlarge` | EC2 instance type for the bastion/registry host |
+| `airgap_registry_disk_gb` | `100` | Root volume size (GB) for bastion (Harbor data + bundle) |
+| `airgap_msr_version` | `v4.13.3` | MSR4 (Harbor) offline installer version |
+| `mke4k_bundle_url` | *(auto)* | Override the MKE4k bundle download URL |
+
+## Airgap Architecture
+
+The airgap deployment creates true network isolation: cluster nodes in a private subnet with no internet access, and a bastion/registry host in a public subnet running MSR4 (Harbor).
+
+```
+                    Internet
+                       |
+              +--------+--------+
+              |  Dedicated VPC  |
+              |   172.31.0.0/16   |
+              |                 |
+    +---------+---------+       |
+    |   Public Subnet   |       |
+    |   172.31.0.0/24     |       |
+    |   (has IGW)       |       |
+    |                   |       |
+    |  +-----------+    |       |
+    |  |  Bastion  |    |       |
+    |  |  (MSR4)   |<---+------+-- SSH from user
+    |  |  Pub IP   |    |       |
+    |  +-----------+    |       |
+    +---------+---------+       |
+              | (VPC routing)   |
+    +---------+---------+       |
+    |  Private Subnet   |       |
+    |  172.31.1.0/24    |       |
+    |  (no IGW route)   |       |
+    |                   |       |
+    |  +-----------+    |       |
+    |  | Int. NLB  |<---+------+-- kubectl / MKE UI (via tunnel)
+    |  +-----------+    |       |
+    |  +------------+   |       |
+    |  | Controller |   |       |
+    |  | (priv IP)  |   |       |
+    |  +------------+   |       |
+    |  +------------+   |       |
+    |  |   Worker   |   |       |
+    |  | (priv IP)  |   |       |
+    |  +------------+   |       |
+    +-------------------+       |
+              +-----------------+
+```
+
+**Traffic flows:**
+- User -> Bastion: SSH (port 22) via public IP
+- User -> NLB: via SSH tunnel through bastion (NLB is internal, not internet-facing)
+- NLB -> Cluster nodes: ports 6443, 9443, 33001 via private IPs (IP-type targets, supports hairpin)
+- Cluster nodes -> Bastion: Harbor registry (443) via bastion private IP (VPC routing)
+- Bastion -> Cluster nodes: SSH (22) for mkectl (VPC routing)
+- Cluster nodes -> Internet: **blocked** (no IGW route in private subnet)
+
+## Emergency Cleanup
+
+If you lose Terraform state (e.g. removed the Docker container), use the cleanup script to find and delete resources by cluster tag:
+
+```bash
+./bin/cleanup-aws.sh <cluster-name> [region]
+# e.g.
+./bin/cleanup-aws.sh mke4k-lab-a3f2 eu-central-1
+```
+
+The script shows all discovered resources first, then asks for confirmation before each deletion step.

@@ -1,5 +1,5 @@
 # ---------- STAGE 1: Builder ----------
-FROM ubuntu:22.04 AS builder
+FROM --platform=linux/amd64 ubuntu:22.04 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 WORKDIR /build
@@ -55,7 +55,7 @@ RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/
     chmod +x yq
 
 # ---------- STAGE 2: Runtime ----------
-FROM ubuntu:22.04
+FROM --platform=linux/amd64 ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 WORKDIR /mke4k-lab

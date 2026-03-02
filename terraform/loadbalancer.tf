@@ -4,7 +4,7 @@
 resource "aws_security_group" "nlb" {
   name        = "${var.cluster_name}-nlb-sg"
   description = "MKE4k NLB - inbound on listener ports, outbound to cluster nodes"
-  vpc_id      = data.aws_vpc.default.id
+  vpc_id      = aws_vpc.lab.id
 
   ingress {
     description = "Kubernetes API"
@@ -66,9 +66,9 @@ resource "aws_security_group" "nlb" {
 # ---------------------------------------------------------------------------
 resource "aws_lb" "cluster" {
   name               = "${var.cluster_name}-nlb"
-  internal           = false
+  internal           = var.airgap_enabled
   load_balancer_type = "network"
-  subnets            = data.aws_subnets.default.ids
+  subnets            = var.airgap_enabled ? [aws_subnet.airgap_private[0].id] : [aws_subnet.public.id]
   security_groups    = [aws_security_group.nlb.id]
 
   tags = {
@@ -81,10 +81,11 @@ resource "aws_lb" "cluster" {
 # Target Groups
 # ---------------------------------------------------------------------------
 resource "aws_lb_target_group" "kube_api" {
-  name     = "${var.cluster_name}-kube-api"
-  port     = 6443
-  protocol = "TCP"
-  vpc_id   = data.aws_vpc.default.id
+  name        = "${var.cluster_name}-kube-api"
+  port        = 6443
+  protocol    = "TCP"
+  target_type = "ip"
+  vpc_id      = aws_vpc.lab.id
 
   health_check {
     protocol            = "TCP"
@@ -101,10 +102,11 @@ resource "aws_lb_target_group" "kube_api" {
 }
 
 resource "aws_lb_target_group" "controller_join" {
-  name     = "${var.cluster_name}-ctrl-join"
-  port     = 9443
-  protocol = "TCP"
-  vpc_id   = data.aws_vpc.default.id
+  name        = "${var.cluster_name}-ctrl-join"
+  port        = 9443
+  protocol    = "TCP"
+  target_type = "ip"
+  vpc_id      = aws_vpc.lab.id
 
   health_check {
     protocol            = "TCP"
@@ -121,10 +123,11 @@ resource "aws_lb_target_group" "controller_join" {
 }
 
 resource "aws_lb_target_group" "ingress" {
-  name     = "${var.cluster_name}-ingress"
-  port     = 33001
-  protocol = "TCP"
-  vpc_id   = data.aws_vpc.default.id
+  name        = "${var.cluster_name}-ingress"
+  port        = 33001
+  protocol    = "TCP"
+  target_type = "ip"
+  vpc_id      = aws_vpc.lab.id
 
   health_check {
     protocol            = "TCP"
@@ -182,20 +185,20 @@ resource "aws_lb_listener" "ingress" {
 resource "aws_lb_target_group_attachment" "kube_api" {
   count            = var.controller_count
   target_group_arn = aws_lb_target_group.kube_api.arn
-  target_id        = aws_instance.cluster-controller[count.index].id
+  target_id        = aws_instance.cluster-controller[count.index].private_ip
   port             = 6443
 }
 
 resource "aws_lb_target_group_attachment" "controller_join" {
   count            = var.controller_count
   target_group_arn = aws_lb_target_group.controller_join.arn
-  target_id        = aws_instance.cluster-controller[count.index].id
+  target_id        = aws_instance.cluster-controller[count.index].private_ip
   port             = 9443
 }
 
 resource "aws_lb_target_group_attachment" "ingress" {
   count            = var.controller_count
   target_group_arn = aws_lb_target_group.ingress.arn
-  target_id        = aws_instance.cluster-controller[count.index].id
+  target_id        = aws_instance.cluster-controller[count.index].private_ip
   port             = 33001
 }

@@ -5,6 +5,7 @@ resource "aws_instance" "cluster-workers" {
   key_name               = aws_key_pair.cluster.key_name
   iam_instance_profile   = var.ccm_enabled ? aws_iam_instance_profile.mke4k_ccm[0].name : null
   vpc_security_group_ids = [aws_security_group.cluster_allow_ssh.id]
+  subnet_id              = var.airgap_enabled ? aws_subnet.airgap_private[0].id : aws_subnet.public.id
 
   user_data = <<-EOF
     #!/bin/bash
