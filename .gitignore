@@ -1,5 +1,9 @@
 .cluster-id
+.claude
 .DS_Store
+mke3/
+*.txt
+!requirements.txt
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/.terraform/

@@ -61,7 +61,7 @@ mcr_channel="stable-25.0.14"
 
 # Admin username for the MKE3 UI.
 # The password is auto-generated on first deploy and saved to
-# terraform/mke3_credentials.txt — printed in the deploy summary.
+# terraform/mke3_credentials.txt - printed in the deploy summary.
 mke3_admin_username="admin"
 
 # ============================================================

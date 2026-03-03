@@ -1127,7 +1127,7 @@ print_deploy_summary() {
     sep
     bline "  Load Balancer"
     local lb_chunk_w=$(( W - 4 ))
-    local lb_remaining="${lb_dns}"
+    local lb_remaining="https://${lb_dns}"
     while [[ ${#lb_remaining} -gt ${lb_chunk_w} ]]; do
         bline "    ${lb_remaining:0:${lb_chunk_w}}"
         lb_remaining="${lb_remaining:${lb_chunk_w}}"
@@ -1297,7 +1297,7 @@ print_airgap_deploy_summary() {
     printf "╚%s╝\n" "${SEP}"
 
     echo ""
-    echo -e "  ${BOLD}NLB:${RESET}       ${lb_dns}"
+    echo -e "  ${BOLD}NLB:${RESET}       https://${lb_dns}"
     echo -e "  ${BOLD}SSH:${RESET}       t connect bastion      (direct)"
     echo -e "             t connect m1           (via bastion ProxyJump)"
     echo -e "  ${BOLD}Tunnels:${RESET}   t tunnel dashboard     → https://localhost:3000"
@@ -1527,13 +1527,13 @@ cmd_show_nodes() {
     fi
 
     echo -e "\n${BOLD}MKE4k Load Balancer:${RESET}"
-    echo "  ${lb_dns}"
+    echo "  https://${lb_dns}"
 
     local mke3_lb_dns
     mke3_lb_dns="$(echo "${output}" | jq -r '.mke3_lb_dns_name.value' 2>/dev/null || echo "")"
     if [[ -n "${mke3_lb_dns}" ]]; then
         echo -e "\n${BOLD}MKE3 Load Balancer:${RESET}"
-        echo "  ${mke3_lb_dns}"
+        echo "  https://${mke3_lb_dns}"
     fi
     echo ""
 }
@@ -1603,42 +1603,40 @@ cmd_tunnel() {
 # Usage
 # ---------------------------------------------------------------------------
 usage() {
-    cat <<EOF
-
-${BOLD}mke4k-lab — t CLI${RESET}
-
-Usage: t <command> [subcommand] [mke4|mke3|airgap]
-
-Commands:
-  deploy lab [mke4]       Provision instances + install MKE4k (default)
-  deploy lab mke3         Provision instances + install MKE3 (both NLBs created)
-  deploy lab airgap       Provision airgap lab: bastion + registry + MKE4k
-  deploy instances        Provision EC2 instances and NLBs only (terraform apply)
-  deploy instances mke3   Provision with MKE3 NLB enabled
-  deploy instances airgap Provision bastion + private-subnet nodes (terraform only)
-  deploy cluster          Install MKE4k on existing instances (mkectl apply)
-  deploy cluster mke3     Install MKE3 on existing instances (launchpad apply)
-  deploy cluster airgap   Install MKE4k from bastion (airgap, mkectl on bastion)
-  deploy registry         Setup MSR4 on bastion + upload MKE4k bundle
-  destroy cluster         Uninstall MKE4k from nodes (mkectl reset --force)
-  destroy cluster mke3    Uninstall MKE3 from nodes (launchpad reset --force)
-  destroy cluster airgap  Uninstall MKE4k from bastion (mkectl reset --force)
-  destroy lab             Destroy all AWS infrastructure (terraform destroy)
-  status                  Show cluster node status (kubectl get nodes)
-  show nodes              Print controller/worker IPs and load balancer DNS
-  connect bastion         SSH to bastion/registry host (airgap)
-  connect <node>          SSH into a node (m1/m2/m3, w1/w2/w3, or raw IP)
-  connect <node> cmd      Run a single command on a node and return
-  tunnel                  Show available SSH tunnels for airgap UIs
-  tunnel dashboard        Port-forward MKE4k Dashboard → https://localhost:3000
-  tunnel registry         Port-forward Harbor Registry → https://localhost:8443
-
-Prerequisites:
-  - AWS credentials exported (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
-  - terraform, mkectl, kubectl, jq in PATH
-  - Edit 'config' before deploying
-
-EOF
+    echo ""
+    echo -e "${BOLD}mke4k-lab — t CLI${RESET}"
+    echo ""
+    echo "Usage: t <command> [subcommand] [mke4|mke3|airgap]"
+    echo ""
+    echo "Commands:"
+    echo "  deploy lab [mke4]       Provision instances + install MKE4k (default)"
+    echo "  deploy lab mke3         Provision instances + install MKE3 (both NLBs created)"
+    echo "  deploy lab airgap       Provision airgap lab: bastion + registry + MKE4k"
+    echo "  deploy instances        Provision EC2 instances and NLBs only (terraform apply)"
+    echo "  deploy instances mke3   Provision with MKE3 NLB enabled"
+    echo "  deploy instances airgap Provision bastion + private-subnet nodes (terraform only)"
+    echo "  deploy cluster          Install MKE4k on existing instances (mkectl apply)"
+    echo "  deploy cluster mke3     Install MKE3 on existing instances (launchpad apply)"
+    echo "  deploy cluster airgap   Install MKE4k from bastion (airgap, mkectl on bastion)"
+    echo "  deploy registry         Setup MSR4 on bastion + upload MKE4k bundle"
+    echo "  destroy cluster         Uninstall MKE4k from nodes (mkectl reset --force)"
+    echo "  destroy cluster mke3    Uninstall MKE3 from nodes (launchpad reset --force)"
+    echo "  destroy cluster airgap  Uninstall MKE4k from bastion (mkectl reset --force)"
+    echo "  destroy lab             Destroy all AWS infrastructure (terraform destroy)"
+    echo "  status                  Show cluster node status (kubectl get nodes)"
+    echo "  show nodes              Print controller/worker IPs and load balancer DNS"
+    echo "  connect bastion         SSH to bastion/registry host (airgap)"
+    echo "  connect <node>          SSH into a node (m1/m2/m3, w1/w2/w3, or raw IP)"
+    echo "  connect <node> cmd      Run a single command on a node and return"
+    echo "  tunnel                  Show available SSH tunnels for airgap UIs"
+    echo "  tunnel dashboard        Port-forward MKE4k Dashboard → https://localhost:3000"
+    echo "  tunnel registry         Port-forward Harbor Registry → https://localhost:8443"
+    echo ""
+    echo "Prerequisites:"
+    echo "  - AWS credentials exported (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)"
+    echo "  - terraform, mkectl, kubectl, jq in PATH"
+    echo "  - Edit 'config' before deploying"
+    echo ""
 }
 
 # ---------------------------------------------------------------------------

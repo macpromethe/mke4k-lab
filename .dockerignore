@@ -16,6 +16,9 @@ mke3/
 .git
 .gitignore
 .vscode
+.claude
+.dockerignore
+Dockerfile
 CLAUDE.md
 README.md
 bin/cleanup-aws.sh

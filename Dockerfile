@@ -107,8 +107,8 @@ RUN ln -sf /mke4k-lab/bin/t-commandline.bash /usr/local/bin/t
 RUN printf '\n  Welcome to mke4k-lab\n-------------------------------\n  Tools ready: terraform, kubectl, helm, aws, k9s\n  mkectl is downloaded on first use (version from config)\n  Edit /mke4k-lab/config then run: t deploy lab\n\n' \
     > /etc/motd
 
-# Bash config
-COPY .bashrc /root/.bashrc
+# Bash config (already landed via COPY . above; move to /root)
+RUN mv /mke4k-lab/.bashrc /root/.bashrc
 
 # Pre-initialise Terraform providers (speeds up first deploy)
 RUN terraform -chdir=/mke4k-lab/terraform init -input=false && \
