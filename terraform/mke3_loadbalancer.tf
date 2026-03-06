@@ -55,9 +55,9 @@ resource "aws_security_group" "mke3_nlb" {
 resource "aws_lb" "mke3" {
   count              = var.mke3_enabled ? 1 : 0
   name               = "${var.cluster_name}-mke3-nlb"
-  internal           = false
+  internal           = var.airgap_enabled
   load_balancer_type = "network"
-  subnets            = [aws_subnet.public.id]
+  subnets            = var.airgap_enabled ? [aws_subnet.airgap_private[0].id] : [aws_subnet.public.id]
   security_groups    = [aws_security_group.mke3_nlb[0].id]
 
   tags = {

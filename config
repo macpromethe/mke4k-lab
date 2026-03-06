@@ -84,3 +84,7 @@ airgap_msr_version="v4.13.3"
 # NOTE: Airgap bundles are only available for GA versions (e.g. v4.1.1, v4.1.2, v4.1.3).
 #       RC/dev versions only support online install.
 # mke4k_bundle_url=""
+
+# Override the MKE3 image bundle download URL.
+# Default: https://packages.mirantis.com/caas/ucp_images_<mke3_version>.tar.gz
+# mke3_bundle_url=""
