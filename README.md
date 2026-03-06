@@ -2,7 +2,7 @@
 
 A standalone AWS lab provisioning tool for [Mirantis Kubernetes Engine 4k](https://www.mirantis.com/software/mke-4/) and MKE3.
 
-Terraform provisions a dedicated VPC, EC2 instances, NLB, and IAM role; `mkectl apply` / `launchpad apply` installs the product. Supports three deployment modes: **MKE4k** (default), **MKE3** (for upgrade testing), and **Airgap** (true network isolation with a private registry).
+Terraform provisions a dedicated VPC, EC2 instances, NLB, and IAM role; `mkectl apply` / `launchpad apply` installs the product. Supports four deployment modes: **MKE4k** (default), **MKE3** (for upgrade testing), **MKE4k Airgap** (true network isolation with a private registry), and **MKE3 Airgap** (MKE3 in network isolation with proxy-based MCR installation).
 
 ## Quick Start
 
@@ -32,6 +32,7 @@ vi /mke4k-lab/config      # edit cluster settings
 t deploy lab              # MKE4k: provision EC2 + NLB, then install
 t deploy lab mke3         # MKE3:  provision + launchpad apply
 t deploy lab airgap       # Airgap: bastion + registry + MKE4k (no internet on nodes)
+t deploy lab mke3-airgap  # MKE3 Airgap: bastion + registry + proxy + MKE3
 t show nodes              # print IPs
 t destroy lab             # teardown
 ```
@@ -112,7 +113,7 @@ This will:
 | `t deploy cluster mke3` | launchpad apply on existing instances |
 | `t destroy cluster mke3` | Uninstall MKE3 (launchpad reset --force) |
 
-### Airgap
+### Airgap (MKE4k)
 
 | Command | Description |
 |---|---|
@@ -121,8 +122,24 @@ This will:
 | `t deploy registry` | Setup MSR4 on bastion + download & upload MKE4k bundle |
 | `t deploy cluster airgap` | mkectl apply from bastion (registry must exist) |
 | `t destroy cluster airgap` | Uninstall MKE4k from bastion (mkectl reset) |
+
+### Airgap (MKE3)
+
+| Command | Description |
+|---|---|
+| `t deploy lab mke3-airgap` | Full: Terraform + registry + proxy + MKE3 images + launchpad (from bastion) |
+| `t deploy instances mke3-airgap` | Terraform only (bastion + private-subnet nodes + both NLBs) |
+| `t deploy registry mke3` | Setup MSR4 on bastion + download & upload MKE3 images |
+| `t deploy cluster mke3-airgap` | DNS + proxy + launchpad apply from bastion |
+| `t destroy cluster mke3-airgap` | Uninstall MKE3 from bastion (launchpad reset) |
+
+### Tunnels (airgap)
+
+| Command | Description |
+|---|---|
 | `t tunnel` | Show available SSH tunnels with manual commands |
 | `t tunnel dashboard` | MKE4k Dashboard tunnel -> https://localhost:3000 |
+| `t tunnel mke3` | MKE3 Dashboard tunnel -> https://localhost:3000 |
 | `t tunnel registry` | Harbor Registry tunnel -> https://localhost:8443 |
 
 ### General
@@ -179,7 +196,7 @@ mke4k-lab/
 
 | Resource | Details |
 |---|---|
-| `aws_lb` (MKE3 NLB) | Second NLB for MKE3 UI (443) + API (6443) — IP-type targets |
+| `aws_lb` (MKE3 NLB) | Second NLB for MKE3 UI (443) + API (6443) — IP-type targets. Internal when `airgap_enabled` |
 
 ### Airgap mode (`airgap_enabled`)
 
@@ -203,8 +220,12 @@ t connect m1
 # Use kubectl directly
 kubectl --kubeconfig ~/.mke/mke.kubeconf get nodes
 
-# Airgap: access MKE Dashboard (requires -p 3000:3000 on docker run)
+# Airgap: access MKE4k Dashboard (requires -p 3000:3000 on docker run)
 t tunnel dashboard
+# then browse https://localhost:3000
+
+# Airgap: access MKE3 Dashboard (requires -p 3000:3000 on docker run)
+t tunnel mke3
 # then browse https://localhost:3000
 
 # Airgap: access Harbor UI (requires -p 8443:8443 on docker run)
@@ -254,6 +275,7 @@ t destroy lab
 | `airgap_registry_disk_gb` | `100` | Root volume size (GB) for bastion (Harbor data + bundle) |
 | `airgap_msr_version` | `v4.13.3` | MSR4 (Harbor) offline installer version |
 | `mke4k_bundle_url` | *(auto)* | Override the MKE4k bundle download URL |
+| `mke3_bundle_url` | *(auto)* | Override the MKE3 image bundle download URL |
 
 ## Airgap Architecture
 
@@ -298,13 +320,19 @@ The airgap deployment creates true network isolation: cluster nodes in a private
               +-----------------+
 ```
 
-**Traffic flows:**
+**Traffic flows (MKE4k airgap):**
 - User -> Bastion: SSH (port 22) via public IP
 - User -> NLB: via SSH tunnel through bastion (NLB is internal, not internet-facing)
 - NLB -> Cluster nodes: ports 6443, 9443, 33001 via private IPs (IP-type targets, supports hairpin)
 - Cluster nodes -> Bastion: Harbor registry (443) via bastion private IP (VPC routing)
 - Bastion -> Cluster nodes: SSH (22) for mkectl (VPC routing)
 - Cluster nodes -> Internet: **blocked** (no IGW route in private subnet)
+
+**Additional traffic flows (MKE3 airgap):**
+- Cluster nodes -> Bastion: Squid proxy (3128) for MCR APT package installation
+- Squid proxy -> Internet: HTTPS CONNECT to `*.mirantis.com`, `*.docker.com`, `*.ubuntu.com` (whitelisted domains only)
+- Cluster nodes -> Bastion: Docker image pulls from Harbor `mke3` project (443)
+- MKE3 NLB (internal): ports 443 (MKE3 UI) + 6443 (kube-api) — same private subnet as MKE4k NLB
 
 ## Emergency Cleanup
 

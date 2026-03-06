@@ -42,6 +42,8 @@ _T_MKECTL=0
 _T_LAUNCHPAD=0
 _T_REGISTRY=0
 _T_BUNDLE=0
+_T_PROXY=0
+_T_MKE3_IMAGES=0
 
 timer_deploy_start() {
     _T_DEPLOY_START=$(date +%s)
@@ -518,6 +520,316 @@ RESOLVEOF
 }
 
 # ---------------------------------------------------------------------------
+# Airgap — Squid forward proxy on bastion (for MCR APT install on airgap nodes)
+# ---------------------------------------------------------------------------
+setup_squid_proxy() {
+    local output ssh_key bastion_ip bastion_private_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    bastion_private_ip="$(echo "${output}" | jq -r '.bastion_private_ip.value')"
+
+    info "Setting up Squid proxy on bastion (${bastion_ip})..."
+
+    ssh_node "${ssh_key}" "${bastion_ip}" "
+        set -euo pipefail
+        if command -v squid &>/dev/null; then
+            echo '>>> Squid already installed'
+        else
+            echo '>>> Installing Squid...'
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq squid >/dev/null 2>&1
+        fi
+
+        echo '>>> Configuring Squid...'
+        sudo tee /etc/squid/squid.conf > /dev/null <<'SQUIDEOF'
+# Allow private subnet (cluster nodes)
+acl cluster_nodes src 172.31.1.0/24
+
+# Allowed destination domains for MCR + launchpad installs + OS packages
+acl allowed_domains dstdomain .mirantis.com .docker.com .docker.io
+acl allowed_domains dstdomain .ubuntu.com .canonical.com .amazonaws.com
+acl allowed_domains dstdomain .dl.k8s.io
+
+# SSL bump is NOT used — CONNECT tunnelling for HTTPS
+acl SSL_ports port 443
+acl Safe_ports port 80 443
+
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
+
+# Allow cluster nodes to any of the allowed domains
+http_access allow cluster_nodes allowed_domains
+
+# Deny everything else
+http_access deny all
+
+http_port 3128
+SQUIDEOF
+
+        sudo systemctl restart squid
+        sudo systemctl enable squid
+        echo '>>> Squid proxy ready on port 3128'
+    "
+
+    success "Squid proxy configured on bastion."
+}
+
+# ---------------------------------------------------------------------------
+# Airgap — configure HTTP proxy on cluster nodes (for MCR package install)
+# ---------------------------------------------------------------------------
+setup_node_proxy() {
+    local output ssh_key bastion_ip bastion_private_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    bastion_private_ip="$(echo "${output}" | jq -r '.bastion_private_ip.value')"
+
+    local all_ips=()
+    mapfile -t all_ips < <(echo "${output}" | jq -r '.controller_private_ips.value[], .worker_private_ips.value[]' 2>/dev/null)
+
+    if [[ ${#all_ips[@]} -eq 0 ]]; then
+        warn "No cluster node IPs found — skipping proxy setup."
+        return
+    fi
+
+    local reg_host="${registry_hostname}"
+    local proxy_url="http://${bastion_private_ip}:3128"
+
+    # Build no_proxy list with all node IPs (curl doesn't support CIDR notation)
+    local no_proxy_list="localhost,127.0.0.1,${bastion_private_ip},${reg_host}"
+    for ip in "${all_ips[@]}"; do
+        no_proxy_list="${no_proxy_list},${ip}"
+    done
+
+    info "Configuring HTTP proxy on ${#all_ips[@]} cluster node(s) → bastion (${bastion_private_ip}:3128)..."
+
+    # SCP registry CA cert to each node for Docker trust
+    local cert_file="${TERRAFORM_DIR}/registry_ca.crt"
+    [[ -f "${cert_file}" ]] || die "Registry CA cert not found at ${cert_file}. Run 't deploy registry' first."
+
+    for node_ip in "${all_ips[@]}"; do
+        info "  Proxy → ${node_ip}"
+
+        # SCP cert via bastion
+        scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" \
+            -o "ProxyCommand=ssh -q -o StrictHostKeyChecking=no -i ${ssh_key} -W %h:%p ubuntu@${bastion_ip}" \
+            "${cert_file}" "ubuntu@${node_ip}:/tmp/registry_ca.crt"
+
+        ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "
+            set -euo pipefail
+
+            # APT proxy
+            echo 'Acquire::http::Proxy \"${proxy_url}\";
+Acquire::https::Proxy \"${proxy_url}\";' | sudo tee /etc/apt/apt.conf.d/01proxy >/dev/null
+
+            # Environment proxy (pam_env.so reads on PAM login sessions)
+            sudo tee /etc/environment > /dev/null <<'ENVEOF'
+http_proxy=${proxy_url}
+https_proxy=${proxy_url}
+HTTP_PROXY=${proxy_url}
+HTTPS_PROXY=${proxy_url}
+no_proxy=${no_proxy_list}
+NO_PROXY=${no_proxy_list}
+ENVEOF
+
+            # System-wide bashrc — sourced for all bash invocations including
+            # non-login SSH exec channels (which is how launchpad runs commands)
+            if ! grep -q 'http_proxy' /etc/bash.bashrc 2>/dev/null; then
+                sudo tee -a /etc/bash.bashrc > /dev/null <<'BASHRCEOF'
+
+# Proxy settings for airgap MCR installation
+export http_proxy=${proxy_url}
+export https_proxy=${proxy_url}
+export HTTP_PROXY=${proxy_url}
+export HTTPS_PROXY=${proxy_url}
+export no_proxy=${no_proxy_list}
+export NO_PROXY=${no_proxy_list}
+BASHRCEOF
+            fi
+
+            # Profile.d script for login shells
+            sudo tee /etc/profile.d/proxy.sh > /dev/null <<'PROFILEEOF'
+export http_proxy=${proxy_url}
+export https_proxy=${proxy_url}
+export HTTP_PROXY=${proxy_url}
+export HTTPS_PROXY=${proxy_url}
+export no_proxy=${no_proxy_list}
+export NO_PROXY=${no_proxy_list}
+PROFILEEOF
+
+            # Preserve proxy vars through sudo
+            echo 'Defaults env_keep += \"http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY\"' \
+                | sudo tee /etc/sudoers.d/proxy-env >/dev/null
+            sudo chmod 440 /etc/sudoers.d/proxy-env
+
+            # Disable unattended-upgrades to prevent apt lock contention with launchpad
+            sudo systemctl disable --now unattended-upgrades 2>/dev/null || true
+            sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+            # Wait for any running apt/dpkg to finish
+            while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 2; done
+
+            # Disable default Ubuntu repos — they are huge, slow through proxy, and
+            # cause hash-sum-mismatch errors via Squid. Launchpad only needs the
+            # Mirantis repo (added by the MCR installer script). Base packages
+            # (curl, sudo, iptables) are already on the AMI.
+            sudo mv /etc/apt/sources.list /etc/apt/sources.list.disabled 2>/dev/null || true
+            sudo mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.disabled 2>/dev/null || true
+
+            # Docker registry CA trust (MCR will read this on start)
+            sudo mkdir -p /etc/docker/certs.d/${reg_host}
+            sudo cp /tmp/registry_ca.crt /etc/docker/certs.d/${reg_host}/ca.crt
+            rm -f /tmp/registry_ca.crt
+        "
+    done
+
+    success "HTTP proxy + registry CA configured on all cluster nodes."
+}
+
+# ---------------------------------------------------------------------------
+# Airgap — download MKE3 image bundle + upload to Harbor
+# ---------------------------------------------------------------------------
+upload_mke3_images() {
+    local output ssh_key bastion_ip bastion_private_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    bastion_private_ip="$(echo "${output}" | jq -r '.bastion_private_ip.value')"
+
+    local creds_file="${TERRAFORM_DIR}/registry_credentials.txt"
+    [[ -f "${creds_file}" ]] || die "Registry credentials not found. Run 't deploy registry' first."
+    local registry_pass
+    registry_pass="$(grep '^password=' "${creds_file}" | cut -d= -f2)"
+
+    local reg_host="${registry_hostname}"
+    local bundle_url="${MKE3_BUNDLE_URL:-https://packages.mirantis.com/caas/ucp_images_${mke3_version}.tar.gz}"
+
+    # Create 'mke3' project in Harbor (idempotent)
+    ssh_node "${ssh_key}" "${bastion_ip}" "
+        set -euo pipefail
+        if curl -sk -u 'admin:${registry_pass}' \
+            'https://${bastion_private_ip}/api/v2.0/projects?name=mke3' 2>&1 | grep -q '\"name\":\"mke3\"'; then
+            echo '>>> Project mke3 already exists'
+        else
+            echo '>>> Creating Harbor project: mke3'
+            curl -sk -u 'admin:${registry_pass}' \
+                -X POST 'https://${bastion_private_ip}/api/v2.0/projects' \
+                -H 'Content-Type: application/json' \
+                -d '{\"project_name\":\"mke3\",\"public\":true}'
+            echo ''
+            echo '>>> Project mke3 created'
+        fi
+    "
+
+    info "Downloading + uploading MKE3 images to registry..."
+    ssh_node "${ssh_key}" "${bastion_ip}" "
+        set -euo pipefail
+
+        BUNDLE_DIR=~/mke3_bundle
+        REGISTRY='${reg_host}'
+        BUNDLE_URL='${bundle_url}'
+
+        # Download bundle if not already present
+        if [[ ! -f \"\${BUNDLE_DIR}/ucp_images.tar.gz\" ]]; then
+            echo '>>> Downloading MKE3 image bundle...'
+            mkdir -p \"\${BUNDLE_DIR}\"
+            curl -fL --progress-bar \"\${BUNDLE_URL}\" -o \"\${BUNDLE_DIR}/ucp_images.tar.gz\"
+        else
+            echo '>>> MKE3 bundle already downloaded'
+        fi
+
+        # Login to registry
+        docker login \${REGISTRY} -u admin -p '${registry_pass}'
+
+        # Load images
+        echo '>>> Loading MKE3 images (docker load)...'
+        loaded=\$(docker load -i \"\${BUNDLE_DIR}/ucp_images.tar.gz\" 2>&1)
+        echo \"\${loaded}\"
+
+        # Parse loaded image names and retag+push
+        echo '>>> Retagging and pushing images to Harbor...'
+        images=\$(echo \"\${loaded}\" | grep '^Loaded image:' | sed 's/Loaded image: //')
+        total=\$(echo \"\${images}\" | wc -l)
+        count=0
+        echo \"\${images}\" | while IFS= read -r img; do
+            [[ -z \"\${img}\" ]] && continue
+            count=\$((count + 1))
+            # Extract name:tag from image (e.g. mirantis/ucp-agent:3.8.2 → ucp-agent:3.8.2)
+            # Handle both mirantis/name:tag and docker.io/mirantis/name:tag formats
+            local_part=\$(echo \"\${img}\" | sed -E 's|^(docker\.io/)?mirantis/||')
+            target=\"\${REGISTRY}/mke3/\${local_part}\"
+            echo \"[\${count}/\${total}] \${img} → \${target}\"
+            docker tag \"\${img}\" \"\${target}\"
+            docker push \"\${target}\" || echo \"  WARNING: failed to push \${target}\"
+        done
+        echo '>>> MKE3 image upload complete.'
+    "
+    success "MKE3 images uploaded to registry."
+}
+
+# ---------------------------------------------------------------------------
+# Airgap — install launchpad on bastion
+# ---------------------------------------------------------------------------
+ensure_launchpad_on_bastion() {
+    local ssh_key="${1}" bastion_ip="${2}"
+    local want="${launchpad_version}"
+    local url="${LAUNCHPAD_DOWNLOAD_URL:-https://github.com/Mirantis/launchpad/releases/download/v${want}/launchpad_linux_amd64_${want}}"
+
+    info "Installing launchpad ${want} on bastion..."
+    ssh_node "${ssh_key}" "${bastion_ip}" "
+        set -euo pipefail
+        if command -v launchpad &>/dev/null; then
+            got=\$(launchpad version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+            if [[ \"\${got}\" == '${want}' ]]; then
+                echo 'launchpad ${want} already installed'
+                exit 0
+            fi
+        fi
+        echo '>>> Downloading launchpad ${want}...'
+        curl -fsSL '${url}' -o /tmp/launchpad
+        sudo install -m 755 /tmp/launchpad /usr/local/bin/launchpad
+        rm -f /tmp/launchpad
+        echo 'launchpad ${want} installed'
+    "
+}
+
+# ---------------------------------------------------------------------------
+# Airgap — run launchpad apply from bastion
+# ---------------------------------------------------------------------------
+launchpad_apply_on_bastion() {
+    local output ssh_key bastion_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    local launchpad_yaml="${TERRAFORM_DIR}/launchpad.yaml"
+
+    [[ -f "${launchpad_yaml}" ]] || die "launchpad.yaml not found. Run 't deploy instances mke3-airgap' first."
+
+    # SCP launchpad.yaml + SSH key to bastion
+    scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" "${launchpad_yaml}" "ubuntu@${bastion_ip}:~/launchpad.yaml"
+    scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" "${ssh_key}" "ubuntu@${bastion_ip}:~/aws_private.pem"
+    ssh_node "${ssh_key}" "${bastion_ip}" "chmod 600 ~/aws_private.pem"
+
+    info "Running launchpad apply on bastion (airgap mode)..."
+    ssh_node "${ssh_key}" "${bastion_ip}" "launchpad apply --accept-license -c ~/launchpad.yaml"
+
+    success "MKE3 cluster deployment complete (airgap)."
+}
+
+# ---------------------------------------------------------------------------
+# Airgap — run launchpad reset from bastion
+# ---------------------------------------------------------------------------
+launchpad_reset_on_bastion() {
+    local output ssh_key bastion_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+
+    info "Running launchpad reset --force on bastion..."
+    ssh_node "${ssh_key}" "${bastion_ip}" "launchpad reset --force -c ~/launchpad.yaml"
+    success "MKE3 cluster reset complete (airgap)."
+}
+
+# ---------------------------------------------------------------------------
 # Airgap — download MKE4k bundle + upload images to Harbor
 # ---------------------------------------------------------------------------
 upload_mke4k_bundle() {
@@ -546,7 +858,7 @@ upload_mke4k_bundle() {
             echo '>>> Downloading MKE4k bundle...'
             mkdir -p \"\${BUNDLE_DIR}\"
             cd /tmp
-            curl -fsSL '${bundle_url}' -o bundle.tar.gz
+            curl -fL --progress-bar '${bundle_url}' -o bundle.tar.gz
             echo '>>> Extracting bundle...'
             tar -xzf bundle.tar.gz -C \"\${BUNDLE_DIR}\"
             rm bundle.tar.gz
@@ -810,7 +1122,12 @@ ensure_launchpad() {
 # launchpad.yaml generation
 # ---------------------------------------------------------------------------
 generate_launchpad_yaml() {
-    ensure_launchpad
+    local airgap="${1:-false}"
+
+    # In airgap mode launchpad runs from bastion — don't download locally
+    if [[ "${airgap}" != "true" ]]; then
+        ensure_launchpad
+    fi
 
     local launchpad_yaml="${TERRAFORM_DIR}/launchpad.yaml"
     local creds_file="${TERRAFORM_DIR}/mke3_credentials.txt"
@@ -838,16 +1155,29 @@ generate_launchpad_yaml() {
 
     info "Generating launchpad.yaml..."
 
+    # In airgap mode, use private IPs and bastion keypath
+    local ctrl_ips_field="controller_ips"
+    local wkr_ips_field="worker_ips"
+    local key_path="${ssh_key}"
+
+    if [[ "${airgap}" == "true" ]]; then
+        ctrl_ips_field="controller_private_ips"
+        wkr_ips_field="worker_private_ips"
+        key_path="/home/ubuntu/aws_private.pem"   # Path ON the bastion
+    fi
+
     # Build hosts JSON array with jq
     local hosts_json
     hosts_json="$(echo "${output}" | jq -c \
-        --arg key "${ssh_key}" \
+        --arg key "${key_path}" \
+        --arg ctrl_field "${ctrl_ips_field}" \
+        --arg wkr_field "${wkr_ips_field}" \
         '[
-            (.controller_ips.value[] | {
+            (.[$ctrl_field].value[] | {
                 role: "manager",
                 ssh: { address: ., user: "ubuntu", keyPath: $key }
             }),
-            (.worker_ips.value[] | {
+            (.[$wkr_field].value[] | {
                 role: "worker",
                 ssh: { address: ., user: "ubuntu", keyPath: $key }
             })
@@ -884,22 +1214,38 @@ EOF
         info "Added --calico-datastore-type-kdd (mke3_version ${mke3_version} >= 3.7.12)"
     fi
 
+    # Airgap-specific patches: imageRepo → Harbor
+    if [[ "${airgap}" == "true" ]]; then
+        local reg_host="${registry_hostname}"
+        yq e -i ".spec.mke.imageRepo = \"${reg_host}/mke3\"" "${launchpad_yaml}"
+        info "Airgap mode: imageRepo=${reg_host}/mke3"
+    fi
+
     success "launchpad.yaml written to ${launchpad_yaml}"
 
     # Generate nodes.yaml for mkectl upgrade (all nodes, no role field)
-    generate_nodes_yaml "${output}" "${ssh_key}"
+    generate_nodes_yaml "${output}" "${key_path}" "${airgap}"
 }
 
 generate_nodes_yaml() {
     local output="${1}"
-    local ssh_key="${2}"
+    local key_path="${2}"
+    local airgap="${3:-false}"
     local nodes_yaml="${TERRAFORM_DIR}/nodes.yaml"
+
+    local ctrl_field="controller_ips" wkr_field="worker_ips"
+    if [[ "${airgap}" == "true" ]]; then
+        ctrl_field="controller_private_ips"
+        wkr_field="worker_private_ips"
+    fi
 
     local nodes_json
     nodes_json="$(echo "${output}" | jq -c \
-        --arg key "${ssh_key}" \
+        --arg key "${key_path}" \
+        --arg ctrl_field "${ctrl_field}" \
+        --arg wkr_field "${wkr_field}" \
         '[
-            (.controller_ips.value[], .worker_ips.value[]) |
+            (.[$ctrl_field].value[], .[$wkr_field].value[]) |
             { address: ., port: 22, user: "ubuntu", keyPath: $key }
         ]')"
 
@@ -930,6 +1276,89 @@ prompt_mkectl_for_upgrade() {
             ;;
         *)
             info "Skipping. Edit mke4k_version in config and run 't deploy cluster mke4' when ready."
+            ;;
+    esac
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Interactive upgrade prep for MKE3 airgap → MKE4k
+# ---------------------------------------------------------------------------
+prompt_upgrade_prep_airgap() {
+    echo ""
+    local answer
+    read -r -p "$(echo -e "  ${BOLD}Prepare for MKE3 → MKE4k upgrade? (upload bundle + generate config)${RESET} [y/N] ")" answer
+    case "${answer}" in
+        [yY]|[yY][eE][sS])
+            local ver_input
+            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input
+            local target="${ver_input:-${mke4k_version}}"
+            local saved="${mke4k_version}"
+            mke4k_version="${target}"
+
+            local output ssh_key bastion_ip
+            output="$(tf_output)"
+            ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+            bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+
+            # 1. Download mkectl locally (needed for mkectl init to generate yaml schema)
+            ensure_mkectl
+
+            # 2. Install mkectl on bastion
+            ensure_mkectl_on_bastion "${ssh_key}" "${bastion_ip}"
+
+            # 3. Upload MKE4k bundle to Harbor
+            upload_mke4k_bundle
+
+            # 4. Generate mke4.yaml with airgap settings
+            generate_mke4_yaml true
+
+            # 5. SCP mke4.yaml + nodes.yaml + key to bastion
+            local mke4_yaml="${TERRAFORM_DIR}/mke4.yaml"
+            local nodes_yaml="${TERRAFORM_DIR}/nodes.yaml"
+            scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" "${mke4_yaml}" "ubuntu@${bastion_ip}:~/mke4.yaml"
+            scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" "${nodes_yaml}" "ubuntu@${bastion_ip}:~/nodes.yaml"
+            scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" "${ssh_key}" "ubuntu@${bastion_ip}:~/aws_private.pem"
+            ssh_node "${ssh_key}" "${bastion_ip}" "chmod 600 ~/aws_private.pem"
+            success "Upgrade files uploaded to bastion."
+
+            # Read MKE3 credentials for the command
+            local creds_file="${TERRAFORM_DIR}/mke3_credentials.txt"
+            local admin_user admin_pass
+            admin_user="$(grep '^username=' "${creds_file}" 2>/dev/null | cut -d= -f2 || echo "${mke3_admin_username}")"
+            admin_pass="$(grep '^password=' "${creds_file}" 2>/dev/null | cut -d= -f2 || echo "(see ${creds_file})")"
+
+            local mke4k_lb_dns
+            mke4k_lb_dns="$(echo "${output}" | jq -r '.lb_dns_name.value')"
+
+            local reg_host="${registry_hostname}"
+            local ca_path="/etc/docker/certs.d/${reg_host}/ca.crt"
+
+            local debug_flag=""
+            [[ "${debug:-false}" == "true" ]] && debug_flag="-l debug"
+
+            echo ""
+            echo -e "  ${BOLD}To upgrade to MKE4k, SSH to bastion and run:${RESET}"
+            echo ""
+            echo -e "    ${CYAN}mkectl upgrade${RESET} \\"
+            echo "      --hosts-path ~/nodes.yaml \\"
+            echo "      --mke3-admin-username ${admin_user} \\"
+            echo "      --mke3-admin-password ${admin_pass} \\"
+            echo "      --external-address ${mke4k_lb_dns} \\"
+            echo "      --image-registry=${reg_host}/mke \\"
+            echo "      --chart-registry=oci://${reg_host}/mke \\"
+            echo "      --image-registry-ca-file=${ca_path} \\"
+            echo "      --chart-registry-ca-file=${ca_path} \\"
+            echo "      --mke3-airgapped=true \\"
+            echo "      --config ~/mke4.yaml \\"
+            echo "      --force${debug_flag:+ \\}"
+            [[ -n "${debug_flag}" ]] && echo "      ${debug_flag}"
+            echo ""
+
+            mke4k_version="${saved}"
+            ;;
+        *)
+            info "Skipping. Run upgrade prep later with the appropriate commands."
             ;;
     esac
     echo ""
@@ -1307,6 +1736,101 @@ print_airgap_deploy_summary() {
 }
 
 # ---------------------------------------------------------------------------
+# MKE3 Airgap deploy summary
+# ---------------------------------------------------------------------------
+print_mke3_airgap_deploy_summary() {
+    local output
+    output="$(tf_output 2>/dev/null)" || { warn "Could not read terraform output for summary."; return; }
+
+    local mke3_lb_dns mke4k_lb_dns bastion_pub_ip bastion_priv_ip
+    mke3_lb_dns="$(echo "${output}" | jq -r '.mke3_lb_dns_name.value' 2>/dev/null || echo "(unknown)")"
+    mke4k_lb_dns="$(echo "${output}" | jq -r '.lb_dns_name.value'     2>/dev/null || echo "(unknown)")"
+    bastion_pub_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value' 2>/dev/null || echo "(unknown)")"
+    bastion_priv_ip="$(echo "${output}" | jq -r '.bastion_private_ip.value' 2>/dev/null || echo "(unknown)")"
+
+    local controller_ips=() worker_ips=()
+    mapfile -t controller_ips < <(echo "${output}" | jq -r '.controller_private_ips.value[]' 2>/dev/null)
+    mapfile -t worker_ips     < <(echo "${output}" | jq -r '.worker_private_ips.value[]'     2>/dev/null)
+
+    local creds_file="${TERRAFORM_DIR}/mke3_credentials.txt"
+    local admin_user admin_pass
+    admin_user="$(grep '^username=' "${creds_file}" 2>/dev/null | cut -d= -f2 || echo "${mke3_admin_username}")"
+    admin_pass="$(grep '^password=' "${creds_file}" 2>/dev/null | cut -d= -f2 || echo "(see ${creds_file})")"
+
+    local reg_creds_file="${TERRAFORM_DIR}/registry_credentials.txt"
+    local registry_pass
+    registry_pass="$(grep '^password=' "${reg_creds_file}" 2>/dev/null | cut -d= -f2 || echo "(unknown)")"
+
+    local total=$(( _T_TERRAFORM + _T_REGISTRY + _T_MKE3_IMAGES + _T_PROXY + _T_NLB + _T_LAUNCHPAD ))
+
+    local W=58
+    local SEP; SEP="$(printf '═%.0s' $(seq 1 ${W}))"
+    local HDIV; HDIV="$(printf '%.0s-' $(seq 1 33))"
+
+    bline() { printf "║%-${W}s║\n" "$1"; }
+    cline() {
+        local t="$1" lp rp
+        lp=$(( (W - ${#t}) / 2 ))
+        rp=$(( W - ${#t} - lp ))
+        printf "║%*s%s%*s║\n" $lp "" "$t" $rp ""
+    }
+    sep() { printf "╠%s╣\n" "${SEP}"; }
+
+    printf "╔%s╗\n" "${SEP}"
+    cline "mke4k-lab -- MKE3 Airgap Deploy Complete"
+    sep
+    bline "$(printf '  %-18s %-20s %s' 'Cluster' "${cluster_name}" "${region}")"
+    bline "$(printf '  %-18s %s' 'MKE3' "${mke3_version}")"
+    bline "$(printf '  %-18s %s' 'MCR' "${mcr_version} (${mcr_channel})")"
+    bline "$(printf '  %-18s %s' 'Registry' "MSR4 ${airgap_msr_version}")"
+    bline "$(printf '  %-18s %s' 'Airgap' 'true')"
+    sep
+    bline "$(printf '  %-18s %s' 'Bastion (public)' "${bastion_pub_ip}")"
+    bline "$(printf '  %-18s %s' 'Registry host' "${registry_hostname}")"
+    bline "$(printf '  %-18s %s' 'Registry IP' "${bastion_priv_ip}")"
+    bline "$(printf '  %-18s %s' 'Registry user' 'admin')"
+    bline "$(printf '  %-18s %s' 'Registry password' "${registry_pass}")"
+    sep
+    bline "  MKE3 Admin Credentials"
+    bline "$(printf '    %-12s %s' 'Username' "${admin_user}")"
+    bline "$(printf '    %-12s %s' 'Password' "${admin_pass}")"
+    bline "  (saved to terraform/mke3_credentials.txt)"
+    sep
+    bline "  Timing"
+    bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
+    bline "$(printf '    %-22s %s' 'Registry setup'  "$(fmt_duration ${_T_REGISTRY})")"
+    bline "$(printf '    %-22s %s' 'MKE3 images'     "$(fmt_duration ${_T_MKE3_IMAGES})")"
+    bline "$(printf '    %-22s %s' 'Proxy setup'     "$(fmt_duration ${_T_PROXY})")"
+    bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
+    bline "$(printf '    %-22s %s' 'launchpad apply'  "$(fmt_duration ${_T_LAUNCHPAD})")"
+    bline "    ${HDIV}"
+    bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
+    sep
+    bline "  Controllers (private)"
+    local i=1
+    for ip in "${controller_ips[@]}"; do
+        bline "$(printf '    m%-3s %s' "${i}" "${ip}")"
+        (( i++ )) || true
+    done
+    sep
+    bline "  Workers (private)"
+    i=1
+    for ip in "${worker_ips[@]}"; do
+        bline "$(printf '    w%-3s %s' "${i}" "${ip}")"
+        (( i++ )) || true
+    done
+    printf "╚%s╝\n" "${SEP}"
+
+    echo ""
+    echo -e "  ${BOLD}SSH:${RESET}       t connect bastion      (direct)"
+    echo -e "             t connect m1           (via bastion ProxyJump)"
+    echo -e "  ${BOLD}Tunnels:${RESET}   t tunnel mke3          → https://localhost:3000"
+    echo -e "             t tunnel registry      → https://localhost:8443"
+    echo -e "             t tunnel               (show all + manual commands)"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 cmd_deploy_lab_mke4() {
@@ -1460,6 +1984,87 @@ cmd_destroy_cluster_airgap() {
     success "Cluster reset complete (airgap)."
 }
 
+# ---------------------------------------------------------------------------
+# MKE3 Airgap commands
+# ---------------------------------------------------------------------------
+cmd_deploy_lab_mke3_airgap() {
+    load_config
+    write_tfvars true true     # mke3_enabled=true, airgap_enabled=true
+    timer_deploy_start
+
+    tf_init
+    tf_apply
+    timer_phase_end _T_TERRAFORM
+
+    setup_registry             # Docker + bind9 + MSR4 + cert + 'mke' project
+    timer_phase_end _T_REGISTRY
+
+    upload_mke3_images         # Download MKE3 bundle + retag + push to Harbor/mke3
+    timer_phase_end _T_MKE3_IMAGES
+
+    setup_node_dns             # Point each node's systemd-resolved at bastion
+
+    setup_squid_proxy          # Squid on bastion for MCR APT install
+    setup_node_proxy           # APT proxy + env vars + registry CA on nodes
+    timer_phase_end _T_PROXY
+
+    local output ssh_key bastion_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+
+    ensure_launchpad_on_bastion "${ssh_key}" "${bastion_ip}"
+    wait_for_lb
+    timer_phase_end _T_NLB
+
+    generate_launchpad_yaml true   # airgap=true — private IPs, bastion keypath, imageRepo
+    launchpad_apply_on_bastion
+    timer_phase_end _T_LAUNCHPAD
+
+    print_mke3_airgap_deploy_summary
+    prompt_upgrade_prep_airgap
+}
+
+cmd_deploy_instances_mke3_airgap() {
+    load_config
+    write_tfvars true true
+    tf_init
+    tf_apply
+    generate_launchpad_yaml true
+    success "Instances deployed (mke3-airgap). Run 't deploy registry mke3' then 't deploy cluster mke3-airgap'."
+}
+
+cmd_deploy_registry_mke3() {
+    load_config
+    setup_registry
+    upload_mke3_images
+    success "Registry setup + MKE3 image upload complete."
+}
+
+cmd_deploy_cluster_mke3_airgap() {
+    load_config
+    setup_node_dns
+    setup_squid_proxy
+    setup_node_proxy
+
+    local output ssh_key bastion_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+
+    ensure_launchpad_on_bastion "${ssh_key}" "${bastion_ip}"
+    generate_launchpad_yaml true
+    launchpad_apply_on_bastion
+
+    print_mke3_airgap_deploy_summary
+    prompt_upgrade_prep_airgap
+}
+
+cmd_destroy_cluster_mke3_airgap() {
+    load_config
+    launchpad_reset_on_bastion
+}
+
 cmd_destroy_lab() {
     load_config
     write_tfvars
@@ -1547,11 +2152,12 @@ cmd_tunnel() {
     local output
     output="$(tf_output 2>/dev/null)" || die "Could not read terraform output. Has terraform been applied?"
 
-    local ssh_key bastion_pub_ip bastion_priv_ip lb_dns
+    local ssh_key bastion_pub_ip bastion_priv_ip lb_dns mke3_lb_dns
     ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
     bastion_pub_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
     bastion_priv_ip="$(echo "${output}" | jq -r '.bastion_private_ip.value // empty' 2>/dev/null)"
     lb_dns="$(echo "${output}" | jq -r '.lb_dns_name.value' 2>/dev/null)"
+    mke3_lb_dns="$(echo "${output}" | jq -r '.mke3_lb_dns_name.value // empty' 2>/dev/null)"
 
     [[ -n "${bastion_pub_ip}" && "${bastion_pub_ip}" != "null" ]] || \
         die "Tunnel requires an airgap deployment with a bastion host."
@@ -1563,6 +2169,15 @@ cmd_tunnel() {
             info "  Press Ctrl-C to stop."
             ssh -o StrictHostKeyChecking=no -i "${ssh_key}" \
                 -L "0.0.0.0:3000:${lb_dns}:443" -N "ubuntu@${bastion_pub_ip}"
+            ;;
+        mke3)
+            [[ -n "${mke3_lb_dns}" && "${mke3_lb_dns}" != "null" ]] || \
+                die "MKE3 NLB not found. Was terraform applied with mke3_enabled=true?"
+            info "Tunnelling MKE3 Dashboard → https://localhost:3000"
+            info "  (via bastion ${bastion_pub_ip} → MKE3 NLB ${mke3_lb_dns}:443)"
+            info "  Press Ctrl-C to stop."
+            ssh -o StrictHostKeyChecking=no -i "${ssh_key}" \
+                -L "0.0.0.0:3000:${mke3_lb_dns}:443" -N "ubuntu@${bastion_pub_ip}"
             ;;
         registry)
             info "Tunnelling Harbor Registry UI → https://localhost:8443"
@@ -1576,6 +2191,7 @@ cmd_tunnel() {
             echo -e "${BOLD}Available tunnels:${RESET}"
             echo ""
             echo "  t tunnel dashboard    MKE4k Dashboard → https://localhost:3000"
+            echo "  t tunnel mke3         MKE3 Dashboard  → https://localhost:3000"
             echo "  t tunnel registry     Harbor Registry  → https://localhost:8443"
             echo ""
             echo -e "${BOLD}Or run manually:${RESET}"
@@ -1583,6 +2199,11 @@ cmd_tunnel() {
             echo "  # MKE4k Dashboard (via NLB)"
             echo "  ssh -i ${ssh_key} -L 0.0.0.0:3000:${lb_dns}:443 -N ubuntu@${bastion_pub_ip}"
             echo ""
+            if [[ -n "${mke3_lb_dns}" && "${mke3_lb_dns}" != "null" ]]; then
+                echo "  # MKE3 Dashboard (via MKE3 NLB)"
+                echo "  ssh -i ${ssh_key} -L 0.0.0.0:3000:${mke3_lb_dns}:443 -N ubuntu@${bastion_pub_ip}"
+                echo ""
+            fi
             echo "  # Harbor Registry UI"
             echo "  ssh -i ${ssh_key} -L 0.0.0.0:8443:localhost:443 -N ubuntu@${bastion_pub_ip}"
             echo ""
@@ -1594,7 +2215,7 @@ cmd_tunnel() {
             fi
             ;;
         *)
-            die "Unknown tunnel target: ${target}. Try: dashboard, registry"
+            die "Unknown tunnel target: ${target}. Try: dashboard, mke3, registry"
             ;;
     esac
 }
@@ -1606,31 +2227,37 @@ usage() {
     echo ""
     echo -e "${BOLD}mke4k-lab — t CLI${RESET}"
     echo ""
-    echo "Usage: t <command> [subcommand] [mke4|mke3|airgap]"
+    echo "Usage: t <command> [subcommand] [mke4|mke3|airgap|mke3-airgap]"
     echo ""
     echo "Commands:"
-    echo "  deploy lab [mke4]       Provision instances + install MKE4k (default)"
-    echo "  deploy lab mke3         Provision instances + install MKE3 (both NLBs created)"
-    echo "  deploy lab airgap       Provision airgap lab: bastion + registry + MKE4k"
-    echo "  deploy instances        Provision EC2 instances and NLBs only (terraform apply)"
-    echo "  deploy instances mke3   Provision with MKE3 NLB enabled"
-    echo "  deploy instances airgap Provision bastion + private-subnet nodes (terraform only)"
-    echo "  deploy cluster          Install MKE4k on existing instances (mkectl apply)"
-    echo "  deploy cluster mke3     Install MKE3 on existing instances (launchpad apply)"
-    echo "  deploy cluster airgap   Install MKE4k from bastion (airgap, mkectl on bastion)"
-    echo "  deploy registry         Setup MSR4 on bastion + upload MKE4k bundle"
-    echo "  destroy cluster         Uninstall MKE4k from nodes (mkectl reset --force)"
-    echo "  destroy cluster mke3    Uninstall MKE3 from nodes (launchpad reset --force)"
-    echo "  destroy cluster airgap  Uninstall MKE4k from bastion (mkectl reset --force)"
-    echo "  destroy lab             Destroy all AWS infrastructure (terraform destroy)"
-    echo "  status                  Show cluster node status (kubectl get nodes)"
-    echo "  show nodes              Print controller/worker IPs and load balancer DNS"
-    echo "  connect bastion         SSH to bastion/registry host (airgap)"
-    echo "  connect <node>          SSH into a node (m1/m2/m3, w1/w2/w3, or raw IP)"
-    echo "  connect <node> cmd      Run a single command on a node and return"
-    echo "  tunnel                  Show available SSH tunnels for airgap UIs"
-    echo "  tunnel dashboard        Port-forward MKE4k Dashboard → https://localhost:3000"
-    echo "  tunnel registry         Port-forward Harbor Registry → https://localhost:8443"
+    echo "  deploy lab [mke4]           Provision instances + install MKE4k (default)"
+    echo "  deploy lab mke3             Provision instances + install MKE3 (both NLBs)"
+    echo "  deploy lab airgap           Airgap lab: bastion + registry + MKE4k"
+    echo "  deploy lab mke3-airgap      Airgap lab: bastion + registry + proxy + MKE3"
+    echo "  deploy instances            Terraform only (MKE4k)"
+    echo "  deploy instances mke3       Terraform only + MKE3 NLB"
+    echo "  deploy instances airgap     Terraform only (bastion + private subnet)"
+    echo "  deploy instances mke3-airgap  Terraform only (MKE3 + bastion + private subnet)"
+    echo "  deploy cluster              Install MKE4k (mkectl apply)"
+    echo "  deploy cluster mke3         Install MKE3 (launchpad apply)"
+    echo "  deploy cluster airgap       Install MKE4k from bastion (airgap)"
+    echo "  deploy cluster mke3-airgap  Install MKE3 from bastion (airgap + proxy)"
+    echo "  deploy registry             Setup MSR4 + upload MKE4k bundle"
+    echo "  deploy registry mke3        Setup MSR4 + upload MKE3 images"
+    echo "  destroy cluster             Uninstall MKE4k (mkectl reset)"
+    echo "  destroy cluster mke3        Uninstall MKE3 (launchpad reset)"
+    echo "  destroy cluster airgap      Uninstall MKE4k from bastion"
+    echo "  destroy cluster mke3-airgap Uninstall MKE3 from bastion"
+    echo "  destroy lab                 Destroy all AWS infrastructure (terraform destroy)"
+    echo "  status                      Show cluster node status (kubectl get nodes)"
+    echo "  show nodes                  Print controller/worker IPs and load balancer DNS"
+    echo "  connect bastion             SSH to bastion/registry host (airgap)"
+    echo "  connect <node>              SSH into a node (m1/m2/m3, w1/w2/w3, or raw IP)"
+    echo "  connect <node> cmd          Run a single command on a node and return"
+    echo "  tunnel                      Show available SSH tunnels for airgap UIs"
+    echo "  tunnel dashboard            MKE4k Dashboard → https://localhost:3000"
+    echo "  tunnel mke3                 MKE3 Dashboard  → https://localhost:3000"
+    echo "  tunnel registry             Harbor Registry  → https://localhost:8443"
     echo ""
     echo "Prerequisites:"
     echo "  - AWS credentials exported (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)"
@@ -1650,29 +2277,38 @@ case "${COMMAND}" in
         case "${SUBCOMMAND}" in
             lab)
                 case "${3:-mke4}" in
-                    mke4)   cmd_deploy_lab_mke4 ;;
-                    mke3)   cmd_deploy_lab_mke3 ;;
-                    airgap) cmd_deploy_lab_airgap ;;
-                    *)      die "Unknown variant: t deploy lab ${3}. Try: mke4, mke3, airgap" ;;
+                    mke4)        cmd_deploy_lab_mke4 ;;
+                    mke3)        cmd_deploy_lab_mke3 ;;
+                    airgap)      cmd_deploy_lab_airgap ;;
+                    mke3-airgap) cmd_deploy_lab_mke3_airgap ;;
+                    *)           die "Unknown variant: t deploy lab ${3}. Try: mke4, mke3, airgap, mke3-airgap" ;;
                 esac
                 ;;
             instances)
                 case "${3:-mke4}" in
-                    mke4)   cmd_deploy_instances ;;
-                    mke3)   cmd_deploy_instances_mke3 ;;
-                    airgap) cmd_deploy_instances_airgap ;;
-                    *)      die "Unknown variant: t deploy instances ${3}. Try: mke4, mke3, airgap" ;;
+                    mke4)        cmd_deploy_instances ;;
+                    mke3)        cmd_deploy_instances_mke3 ;;
+                    airgap)      cmd_deploy_instances_airgap ;;
+                    mke3-airgap) cmd_deploy_instances_mke3_airgap ;;
+                    *)           die "Unknown variant: t deploy instances ${3}. Try: mke4, mke3, airgap, mke3-airgap" ;;
                 esac
                 ;;
             cluster)
                 case "${3:-mke4}" in
-                    mke4)   cmd_deploy_cluster ;;
-                    mke3)   cmd_deploy_cluster_mke3 ;;
-                    airgap) cmd_deploy_cluster_airgap ;;
-                    *)      die "Unknown variant: t deploy cluster ${3}. Try: mke4, mke3, airgap" ;;
+                    mke4)        cmd_deploy_cluster ;;
+                    mke3)        cmd_deploy_cluster_mke3 ;;
+                    airgap)      cmd_deploy_cluster_airgap ;;
+                    mke3-airgap) cmd_deploy_cluster_mke3_airgap ;;
+                    *)           die "Unknown variant: t deploy cluster ${3}. Try: mke4, mke3, airgap, mke3-airgap" ;;
                 esac
                 ;;
-            registry)  cmd_deploy_registry ;;
+            registry)
+                case "${3:-mke4}" in
+                    mke4|"")     cmd_deploy_registry ;;
+                    mke3)        cmd_deploy_registry_mke3 ;;
+                    *)           die "Unknown variant: t deploy registry ${3}. Try: mke4, mke3" ;;
+                esac
+                ;;
             *)         die "Unknown subcommand: t deploy ${SUBCOMMAND}. Try: lab, instances, cluster, registry" ;;
         esac
         ;;
@@ -1681,10 +2317,11 @@ case "${COMMAND}" in
             lab)     cmd_destroy_lab ;;
             cluster)
                 case "${3:-mke4}" in
-                    mke4)   cmd_destroy_cluster ;;
-                    mke3)   cmd_destroy_cluster_mke3 ;;
-                    airgap) cmd_destroy_cluster_airgap ;;
-                    *)      die "Unknown variant: t destroy cluster ${3}. Try: mke4, mke3, airgap" ;;
+                    mke4)        cmd_destroy_cluster ;;
+                    mke3)        cmd_destroy_cluster_mke3 ;;
+                    airgap)      cmd_destroy_cluster_airgap ;;
+                    mke3-airgap) cmd_destroy_cluster_mke3_airgap ;;
+                    *)           die "Unknown variant: t destroy cluster ${3}. Try: mke4, mke3, airgap, mke3-airgap" ;;
                 esac
                 ;;
             *)       die "Unknown subcommand: t destroy ${SUBCOMMAND}. Try: lab, cluster" ;;

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A standalone AWS lab provisioning tool for [Mirantis Kubernetes Engine 4k](https://www.mirantis.com/software/mke-4/). Terraform provisions a dedicated VPC, EC2 instances, NLB, and IAM; `mkectl apply` installs MKE4k on top. Supports online, MKE3, and fully airgapped deployments.
+A standalone AWS lab provisioning tool for [Mirantis Kubernetes Engine 4k](https://www.mirantis.com/software/mke-4/). Terraform provisions a dedicated VPC, EC2 instances, NLB, and IAM; `mkectl apply` installs MKE4k on top. Supports online, MKE3, and fully airgapped deployments (both MKE4k airgap and MKE3 airgap).
 
 ## Usage (Docker — recommended)
 
@@ -44,11 +44,18 @@ t deploy lab mke3         # Terraform (both NLBs) + launchpad apply
 t deploy cluster mke3     # launchpad only
 t destroy cluster mke3    # launchpad reset
 
-# Airgap
+# Airgap (MKE4k)
 t deploy lab airgap       # Full airgap: Terraform + bastion/registry + bundle upload + mkectl
 t deploy instances airgap # Terraform only (bastion + private-subnet nodes)
 t deploy registry         # Setup MSR4 (Harbor) + upload MKE4k bundle
 t deploy cluster airgap   # mkectl apply from bastion
+
+# Airgap (MKE3)
+t deploy lab mke3-airgap       # Full airgap: Terraform + registry + proxy + MKE3
+t deploy instances mke3-airgap # Terraform only (MKE3 + bastion + private subnet)
+t deploy registry mke3         # Setup MSR4 (Harbor) + upload MKE3 images
+t deploy cluster mke3-airgap   # DNS + proxy + launchpad from bastion
+t destroy cluster mke3-airgap  # launchpad reset from bastion
 
 # Common
 t status                  # kubectl get nodes
@@ -59,6 +66,7 @@ t connect m1 "cmd"        # Run a single command on a node
 # Airgap UI tunnels (requires -p port mappings on docker run)
 t tunnel                  # Show available tunnels with manual SSH commands
 t tunnel dashboard        # MKE4k Dashboard → https://localhost:3000
+t tunnel mke3             # MKE3 Dashboard  → https://localhost:3000
 t tunnel registry         # Harbor Registry  → https://localhost:8443
 ```
 
@@ -113,11 +121,26 @@ Edit `config` before deploying. Key variables:
 7. `generate_mke4_yaml true`: uses private IPs, bastion keypath, embeds registry CA via `caData`, sets `airgap.enabled=true`, forces `cloudProvider.enabled=false`
 8. `mkectl_apply_on_bastion`: SCPs mke4.yaml + SSH key to bastion, runs `mkectl apply` there, retrieves kubeconfig
 
+### Deploy flow (MKE3 airgap)
+
+1. `t deploy lab mke3-airgap` sources `config` → writes tfvars with `mke3_enabled=true`, `airgap_enabled=true`
+2. `terraform apply` provisions: dedicated VPC, public subnet (bastion) + private subnet (cluster nodes, no internet), both MKE4k and MKE3 NLBs (both internal in private subnet)
+3. `setup_registry`: installs MCR + bind9 + MSR4 (Harbor) on bastion (reused from MKE4k airgap)
+4. `upload_mke3_images`: downloads `ucp_images_<version>.tar.gz` on bastion, `docker load` + retag + push to Harbor `mke3` project
+5. `setup_node_dns`: configures cluster nodes' systemd-resolved → bastion bind9 (reused)
+6. `setup_squid_proxy`: installs Squid forward proxy on bastion (port 3128), ACL allows only private subnet to Mirantis/Docker/Ubuntu domains
+7. `setup_node_proxy`: configures each cluster node with APT proxy, environment proxy vars, sudoers env_keep, and Docker registry CA cert
+8. `ensure_launchpad_on_bastion`: installs launchpad binary on bastion
+9. `generate_launchpad_yaml true`: uses private IPs, bastion keypath, sets `imageRepo` to Harbor `mke3` project
+10. `launchpad_apply_on_bastion`: SCPs launchpad.yaml + SSH key to bastion, runs `launchpad apply` there
+11. Post-deploy: prompts for MKE3 → MKE4k upgrade preparation (uploads MKE4k bundle + generates mke4.yaml on bastion)
+
 ### Key files
 
 - **`config`** — single user-edited file; sourced by bash, not parsed
 - **`bin/t`** — thin launcher that resolves project root and execs `t-commandline.bash`
 - **`bin/t-commandline.bash`** — all CLI logic: config loading, tfvars generation, mkectl download, mke4.yaml generation, SSH helpers, deploy summary
+- **`bin/cleanup-aws.sh`** — emergency AWS cleanup when Terraform state is lost; finds resources by cluster tag, interactive confirmation
 - **`terraform/vpc.tf`** — dedicated VPC (172.31.0.0/16), internet gateway, public subnet (172.31.0.0/24), route table
 - **`terraform/main.tf`** — provider config, keypair, AMI lookup (Canonical owner ID), security group
 - **`terraform/controller.tf` / `worker.tf`** — EC2 instances (public subnet normally, private subnet in airgap)
@@ -151,3 +174,6 @@ Edit `config` before deploying. Key variables:
 - **DNS chain (airgap)**: cluster node → systemd-resolved → bastion bind9 → VPC DNS (172.31.0.2). Registry hostname (`registry.<cluster>.local`) is served by bind9; all other queries forwarded to VPC DNS. `/etc/hosts` fallback on all nodes for the registry hostname
 - **Registry TLS**: Self-signed cert with SAN covering both FQDN and bastion IP. CA embedded as `caData` in mke4.yaml; mkectl configures containerd trust on each node. Bastion has cert in `/etc/docker/certs.d/` for both FQDN and IP
 - **Bundle upload**: Containerised skopeo (`quay.io/skopeo/stable:v1.18.0`) with `--add-host` for DNS resolution inside the container. Filenames decoded: `&` → `/`, `@` → `:`
+- **Squid proxy (MKE3 airgap)**: Forward proxy on bastion port 3128. Cluster nodes use it for MCR APT package install (`get.mirantis.com`, `repos.mirantis.com`). ACL restricts to Mirantis/Docker/Ubuntu domains only. CONNECT tunnelling for HTTPS — no SSL bump
+- **MKE3 image path (airgap)**: `docker load` from tarball → retag `mirantis/*` → push to `registry.<cluster>.local/mke3/*`. Nodes pull via Docker with `/etc/docker/certs.d/<registry>/ca.crt` trust
+- **MKE3 NLB airgap-aware**: When `airgap_enabled`, MKE3 NLB is internal in private subnet (same as MKE4k NLB)
