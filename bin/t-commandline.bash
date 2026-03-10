@@ -833,6 +833,9 @@ launchpad_reset_on_bastion() {
 # Airgap — download MKE4k bundle + upload images to Harbor
 # ---------------------------------------------------------------------------
 upload_mke4k_bundle() {
+    local upload_mode="${1:-standard}"   # "standard" or "dual-path"
+    local bundle_base="${2:-bundles}"    # directory name under ~/ on bastion
+
     local output ssh_key bastion_ip bastion_private_ip
     output="$(tf_output)"
     ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
@@ -846,46 +849,178 @@ upload_mke4k_bundle() {
 
     local bundle_url="${MKE4K_BUNDLE_URL:-https://packages.mirantis.com/caas/mke_bundle_${mke4k_version}_amd64.tar.gz}"
 
-    info "Downloading + uploading MKE4k bundle to registry..."
-    ssh_node "${ssh_key}" "${bastion_ip}" "
-        set -euo pipefail
+    info "Downloading + uploading MKE4k bundle to registry (mode=${upload_mode}, dir=${bundle_base})..."
 
-        BUNDLE_DIR=~/bundles
-        REGISTRY='${registry_hostname}'
+    if [[ "${upload_mode}" == "dual-path" ]]; then
+        # dual-path mode: use mkectl airgap list-images/list-charts to enumerate artifacts,
+        # upload mke/* images to both mke/<path> and mke/mke/<path> (v4.1.3 workaround)
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+            set -euo pipefail
 
-        # Download bundle if not already present
-        if [[ -z \"\$(find \${BUNDLE_DIR} -name '*.tar' -type f 2>/dev/null | head -1)\" ]]; then
-            echo '>>> Downloading MKE4k bundle...'
-            mkdir -p \"\${BUNDLE_DIR}\"
-            cd /tmp
-            curl -fL --progress-bar '${bundle_url}' -o bundle.tar.gz
-            echo '>>> Extracting bundle...'
-            tar -xzf bundle.tar.gz -C \"\${BUNDLE_DIR}\"
-            rm bundle.tar.gz
-        else
-            echo '>>> Bundle already extracted'
-        fi
+            BUNDLE_DIR=~/${bundle_base}
+            REGISTRY='${registry_hostname}'
 
-        # Login to registry (creates ~/.docker/config.json for skopeo --authfile)
-        docker login \${REGISTRY} -u admin -p '${registry_pass}'
+            # Download bundle if not already present
+            if [[ -z \"\$(find \${BUNDLE_DIR} -name '*.tar' -type f 2>/dev/null | head -1)\" ]]; then
+                echo '>>> Downloading MKE4k bundle...'
+                mkdir -p \"\${BUNDLE_DIR}\"
+                cd /tmp
+                curl -fL --progress-bar '${bundle_url}' -o bundle.tar.gz
+                echo '>>> Extracting bundle...'
+                tar -xzf bundle.tar.gz -C \"\${BUNDLE_DIR}\"
+                rm bundle.tar.gz
+            else
+                echo '>>> Bundle already extracted'
+            fi
 
-        SKOPEO=\"docker run --rm --add-host ${registry_hostname}:${bastion_private_ip} -v /home/ubuntu/.docker/config.json:/config.json -v \${BUNDLE_DIR}:\${BUNDLE_DIR} quay.io/skopeo/stable:v1.18.0\"
+            docker login \${REGISTRY} -u admin -p '${registry_pass}'
+            SKOPEO=\"docker run --rm --add-host ${registry_hostname}:${bastion_private_ip} -v /home/ubuntu/.docker/config.json:/config.json -v \${BUNDLE_DIR}:\${BUNDLE_DIR} quay.io/skopeo/stable:v1.18.0\"
 
-        echo '>>> Uploading images to registry...'
-        total=\$(find \"\${BUNDLE_DIR}\" -name '*.tar' -type f | wc -l)
-        count=0
-        for f in \$(find \"\${BUNDLE_DIR}\" -name '*.tar' -type f | sort); do
-            count=\$((count + 1))
-            # Decode filename: & → /, @ → :
-            img=\$(basename \"\${f}\" .tar | tr '&' '/' | tr '@' ':')
-            echo \"[\${count}/\${total}] \${img}\"
-            \${SKOPEO} copy --src-tls-verify=false --dest-tls-verify=false \
-                --authfile=/config.json --retry-times 3 --multi-arch all -q \
-                \"oci-archive:\${f}\" \"docker://\${REGISTRY}/mke/\${img}\" || \
-                echo \"  WARNING: failed to upload \${img}\"
-        done
-        echo '>>> Bundle upload complete.'
-    "
+            echo '>>> Uploading images (dual-path mode for v4.1.3 workaround)...'
+            count=0; skipped=0; total=0
+
+            # Enumerate images via mkectl airgap list-images
+            while IFS= read -r full_ref; do
+                [[ -z \"\${full_ref}\" ]] && continue
+                total=\$((total + 1))
+
+                # Strip registry prefix to get img_path
+                img_path=\"\${full_ref}\"
+                is_mke=false
+                if [[ \"\${full_ref}\" == registry.mirantis.com/mke/* ]]; then
+                    img_path=\"\${full_ref#registry.mirantis.com/mke/}\"
+                    is_mke=true
+                elif [[ \"\${full_ref}\" == registry.mirantis.com/k0rdent-enterprise/* ]]; then
+                    img_path=\"\${full_ref#registry.mirantis.com/k0rdent-enterprise/}\"
+                fi
+
+                # Encode to find archive: / → &, : → @
+                encoded=\$(echo \"\${img_path}\" | tr '/' '&' | tr ':' '@')
+
+                # Find archive in images/ subdirectory
+                archive=\"\"
+                for subdir in \$(find \"\${BUNDLE_DIR}\" -type d -name images 2>/dev/null); do
+                    if [[ -f \"\${subdir}/\${encoded}.tar\" ]]; then
+                        archive=\"\${subdir}/\${encoded}.tar\"
+                        break
+                    fi
+                done
+                if [[ -z \"\${archive}\" ]]; then
+                    skipped=\$((skipped + 1))
+                    continue
+                fi
+
+                count=\$((count + 1))
+                echo \"[\${count}] \${img_path}\"
+
+                # Standard path: mke/<img_path>
+                \${SKOPEO} copy --src-tls-verify=false --dest-tls-verify=false \
+                    --authfile=/config.json --retry-times 3 --multi-arch all -q \
+                    \"oci-archive:\${archive}\" \"docker://\${REGISTRY}/mke/\${img_path}\" || \
+                    echo \"  WARNING: failed to upload \${img_path}\"
+
+                # Dual path: mke/mke/<img_path> (only for mke/* images)
+                if [[ \"\${is_mke}\" == \"true\" ]]; then
+                    \${SKOPEO} copy --src-tls-verify=false --dest-tls-verify=false \
+                        --authfile=/config.json --retry-times 3 --multi-arch all -q \
+                        \"oci-archive:\${archive}\" \"docker://\${REGISTRY}/mke/mke/\${img_path}\" || \
+                        echo \"  WARNING: failed to upload mke/\${img_path} (dual-path)\"
+                fi
+            done < <(mkectl airgap list-images 2>/dev/null || true)
+
+            echo \">>> Images: \${count} uploaded, \${skipped} skipped (no archive)\"
+
+            echo '>>> Uploading charts (dual-path mode)...'
+            chart_count=0; chart_skipped=0
+
+            while IFS= read -r full_ref; do
+                [[ -z \"\${full_ref}\" ]] && continue
+
+                # Strip oci:// prefix and registry
+                chart_path=\"\${full_ref}\"
+                is_mke_chart=false
+                if [[ \"\${full_ref}\" == oci://registry.mirantis.com/mke/* ]]; then
+                    chart_path=\"\${full_ref#oci://registry.mirantis.com/mke/}\"
+                    is_mke_chart=true
+                elif [[ \"\${full_ref}\" == oci://registry.mirantis.com/k0rdent-enterprise/* ]]; then
+                    chart_path=\"\${full_ref#oci://registry.mirantis.com/k0rdent-enterprise/}\"
+                fi
+
+                encoded=\$(echo \"\${chart_path}\" | tr '/' '&' | tr ':' '@')
+
+                archive=\"\"
+                for subdir in \$(find \"\${BUNDLE_DIR}\" -type d -name charts 2>/dev/null); do
+                    if [[ -f \"\${subdir}/\${encoded}.tar\" ]]; then
+                        archive=\"\${subdir}/\${encoded}.tar\"
+                        break
+                    fi
+                done
+                if [[ -z \"\${archive}\" ]]; then
+                    chart_skipped=\$((chart_skipped + 1))
+                    continue
+                fi
+
+                chart_count=\$((chart_count + 1))
+                echo \"[chart \${chart_count}] \${chart_path}\"
+
+                \${SKOPEO} copy --src-tls-verify=false --dest-tls-verify=false \
+                    --authfile=/config.json --retry-times 3 --multi-arch all -q \
+                    \"oci-archive:\${archive}\" \"docker://\${REGISTRY}/mke/\${chart_path}\" || \
+                    echo \"  WARNING: failed to upload chart \${chart_path}\"
+
+                if [[ \"\${is_mke_chart}\" == \"true\" ]]; then
+                    \${SKOPEO} copy --src-tls-verify=false --dest-tls-verify=false \
+                        --authfile=/config.json --retry-times 3 --multi-arch all -q \
+                        \"oci-archive:\${archive}\" \"docker://\${REGISTRY}/mke/mke/\${chart_path}\" || \
+                        echo \"  WARNING: failed to upload chart mke/\${chart_path} (dual-path)\"
+                fi
+            done < <(mkectl airgap list-charts 2>/dev/null || true)
+
+            echo \">>> Charts: \${chart_count} uploaded, \${chart_skipped} skipped (no archive)\"
+            echo '>>> Bundle upload complete (dual-path).'
+        "
+    else
+        # standard mode: filesystem scan of all .tar files
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+            set -euo pipefail
+
+            BUNDLE_DIR=~/${bundle_base}
+            REGISTRY='${registry_hostname}'
+
+            # Download bundle if not already present
+            if [[ -z \"\$(find \${BUNDLE_DIR} -name '*.tar' -type f 2>/dev/null | head -1)\" ]]; then
+                echo '>>> Downloading MKE4k bundle...'
+                mkdir -p \"\${BUNDLE_DIR}\"
+                cd /tmp
+                curl -fL --progress-bar '${bundle_url}' -o bundle.tar.gz
+                echo '>>> Extracting bundle...'
+                tar -xzf bundle.tar.gz -C \"\${BUNDLE_DIR}\"
+                rm bundle.tar.gz
+            else
+                echo '>>> Bundle already extracted'
+            fi
+
+            # Login to registry (creates ~/.docker/config.json for skopeo --authfile)
+            docker login \${REGISTRY} -u admin -p '${registry_pass}'
+
+            SKOPEO=\"docker run --rm --add-host ${registry_hostname}:${bastion_private_ip} -v /home/ubuntu/.docker/config.json:/config.json -v \${BUNDLE_DIR}:\${BUNDLE_DIR} quay.io/skopeo/stable:v1.18.0\"
+
+            echo '>>> Uploading images to registry...'
+            total=\$(find \"\${BUNDLE_DIR}\" -name '*.tar' -type f | wc -l)
+            count=0
+            for f in \$(find \"\${BUNDLE_DIR}\" -name '*.tar' -type f | sort); do
+                count=\$((count + 1))
+                # Decode filename: & → /, @ → :
+                img=\$(basename \"\${f}\" .tar | tr '&' '/' | tr '@' ':')
+                echo \"[\${count}/\${total}] \${img}\"
+                \${SKOPEO} copy --src-tls-verify=false --dest-tls-verify=false \
+                    --authfile=/config.json --retry-times 3 --multi-arch all -q \
+                    \"oci-archive:\${f}\" \"docker://\${REGISTRY}/mke/\${img}\" || \
+                    echo \"  WARNING: failed to upload \${img}\"
+            done
+            echo '>>> Bundle upload complete.'
+        "
+    fi
     success "MKE4k bundle uploaded to registry."
 }
 
@@ -900,11 +1035,17 @@ ensure_mkectl_on_bastion() {
 
     info "Installing mkectl ${want} + kubectl on bastion..."
     ssh_node "${ssh_key}" "${bastion_ip}" "
+        need_install=true
         if command -v mkectl &>/dev/null; then
             got=\$(mkectl version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-            [[ \"\${got}\" == '${want}' ]] && { echo 'mkectl ${want} already installed'; }
+            if [[ \"\${got}\" == '${want}' ]]; then
+                echo 'mkectl ${want} already installed'
+                need_install=false
+            else
+                echo \"mkectl \${got} found, want ${want} — re-downloading\"
+            fi
         fi
-        if ! command -v mkectl &>/dev/null; then
+        if [[ \"\${need_install}\" == \"true\" ]]; then
             cd /tmp && curl -fsSL '${url}' -o '${tarball}'
             tar -xzf '${tarball}'
             sudo install -m 755 mkectl /usr/local/bin/mkectl
@@ -921,6 +1062,16 @@ ensure_mkectl_on_bastion() {
             echo \"kubectl \${K8S_VER} installed\"
         else
             echo 'kubectl already installed'
+        fi
+        if ! command -v k9s &>/dev/null; then
+            echo '>>> Installing k9s...'
+            curl -fsSL 'https://github.com/derailed/k9s/releases/latest/download/k9s_Linux_amd64.tar.gz' -o /tmp/k9s.tar.gz
+            tar -xzf /tmp/k9s.tar.gz -C /tmp k9s
+            sudo install -m 755 /tmp/k9s /usr/local/bin/k9s
+            rm -f /tmp/k9s.tar.gz /tmp/k9s
+            echo 'k9s installed'
+        else
+            echo 'k9s already installed'
         fi
     "
 }
@@ -956,6 +1107,53 @@ mkectl_apply_on_bastion() {
         warn "Could not retrieve kubeconfig. Use 't connect bastion' to access the cluster."
 
     success "Cluster deployment complete (airgap)."
+}
+
+# ---------------------------------------------------------------------------
+# Airgap — patch CoreDNS to resolve registry hostname directly
+# ---------------------------------------------------------------------------
+# Adds a `hosts` block to CoreDNS Corefile so pods can resolve the registry
+# hostname without going through the systemd-resolved → bind9 chain (which
+# causes transient "no such host" errors due to timeouts).
+patch_coredns_hosts() {
+    local output ssh_key bastion_ip bastion_private_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    bastion_private_ip="$(echo "${output}" | jq -r '.bastion_private_ip.value')"
+
+    info "Patching CoreDNS to resolve ${registry_hostname} → ${bastion_private_ip}..."
+    ssh_node "${ssh_key}" "${bastion_ip}" "
+        set -euo pipefail
+        export KUBECONFIG=~/.mke/mke.kubeconf
+
+        # Check if hosts block already present
+        if kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' | grep -q '${registry_hostname}'; then
+            echo 'CoreDNS already has registry host entry — skipping'
+            exit 0
+        fi
+
+        # Save current Corefile to a temp file
+        kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' > /tmp/Corefile
+
+        # Inject hosts block right after '.:53 {'
+        sed -i '/^\\.:53 {$/a\\
+\\thosts {\\
+\\t\\t${bastion_private_ip} ${registry_hostname}\\
+\\t\\tfallthrough\\
+\\t}' /tmp/Corefile
+
+        # Apply patched configmap
+        kubectl -n kube-system create configmap coredns --from-file=Corefile=/tmp/Corefile --dry-run=client -o yaml | \
+            kubectl apply -f -
+        rm -f /tmp/Corefile
+
+        # Restart CoreDNS to pick up changes
+        kubectl -n kube-system rollout restart deployment coredns
+        kubectl -n kube-system rollout status deployment coredns --timeout=60s
+
+        echo 'CoreDNS patched — registry hostname resolves directly in pods'
+    "
 }
 
 # ---------------------------------------------------------------------------
@@ -1308,7 +1506,9 @@ prompt_upgrade_prep_airgap() {
             ensure_mkectl_on_bastion "${ssh_key}" "${bastion_ip}"
 
             # 3. Upload MKE4k bundle to Harbor
-            upload_mke4k_bundle
+            local upload_mode="standard"
+            [[ "${target}" == "v4.1.3" ]] && upload_mode="dual-path"
+            upload_mke4k_bundle "${upload_mode}" "bundles-${target}"
 
             # 4. Generate mke4.yaml with airgap settings
             generate_mke4_yaml true
@@ -1352,6 +1552,67 @@ prompt_upgrade_prep_airgap() {
             echo "      --mke3-airgapped=true \\"
             echo "      --config ~/mke4.yaml \\"
             echo "      --force${debug_flag:+ \\}"
+            [[ -n "${debug_flag}" ]] && echo "      ${debug_flag}"
+            echo ""
+
+            mke4k_version="${saved}"
+            ;;
+        *)
+            info "Skipping. Run upgrade prep later with the appropriate commands."
+            ;;
+    esac
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Interactive upgrade prep for MKE4k airgap → MKE4k (newer version)
+# ---------------------------------------------------------------------------
+prompt_mke4k_upgrade_prep_airgap() {
+    echo ""
+    local answer
+    read -r -p "$(echo -e "  ${BOLD}Prepare for MKE4k → MKE4k airgap upgrade? (upload bundle + release-matrix)${RESET} [y/N] ")" answer
+    case "${answer}" in
+        [yY]|[yY][eE][sS])
+            local ver_input
+            read -r -p "  Target MKE4k version [${mke4k_version}]: " ver_input
+            local target="${ver_input:-${mke4k_version}}"
+            local saved="${mke4k_version}"
+            mke4k_version="${target}"
+
+            local output ssh_key bastion_ip
+            output="$(tf_output)"
+            ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+            bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+
+            # Determine upload mode: dual-path for v4.1.3 (workaround for double-prefix bug)
+            local upload_mode="standard"
+            [[ "${target}" == "v4.1.3" ]] && upload_mode="dual-path"
+
+            # 1. Install target mkectl locally (needed for mkectl init to generate yaml schema)
+            ensure_mkectl
+
+            # 2. Install target mkectl on bastion
+            ensure_mkectl_on_bastion "${ssh_key}" "${bastion_ip}"
+
+            # 3. Upload target version bundle to Harbor
+            upload_mke4k_bundle "${upload_mode}" "bundles-${target}"
+
+            # 4. Download release-matrix.json to bastion
+            info "Downloading release-matrix.json to bastion..."
+            ssh_node "${ssh_key}" "${bastion_ip}" "
+                curl -fsSL 'https://raw.githubusercontent.com/MirantisContainers/mke-release/refs/heads/main/release-matrix/release-matrix.json' -o ~/release-matrix.json
+                echo 'release-matrix.json downloaded'
+            "
+
+            local debug_flag=""
+            [[ "${debug:-false}" == "true" ]] && debug_flag="-l debug"
+
+            echo ""
+            echo -e "  ${BOLD}To upgrade MKE4k, SSH to bastion and run:${RESET}"
+            echo ""
+            echo -e "    ${CYAN}mkectl upgrade${RESET} \\"
+            echo "      --upgrade-version ${target} \\"
+            echo "      --release-matrix ~/release-matrix.json${debug_flag:+ \\}"
             [[ -n "${debug_flag}" ]] && echo "      ${debug_flag}"
             echo ""
 
@@ -1922,26 +2183,32 @@ cmd_deploy_lab_airgap() {
     setup_registry             # Docker + bind9 + MSR4 + cert + project
     timer_phase_end _T_REGISTRY
 
-    upload_mke4k_bundle        # Download bundle on bastion + upload to Harbor
-    timer_phase_end _T_BUNDLE
-
-    setup_node_dns             # Point each node's systemd-resolved at bastion
-
     local output ssh_key bastion_ip
     output="$(tf_output)"
     ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
     bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
 
     ensure_mkectl_on_bastion "${ssh_key}" "${bastion_ip}"
+
+    local upload_mode="standard"
+    [[ "${mke4k_version}" == "v4.1.3" ]] && upload_mode="dual-path"
+    upload_mke4k_bundle "${upload_mode}"
+    timer_phase_end _T_BUNDLE
+
+    setup_node_dns             # Point each node's systemd-resolved at bastion
+
     wait_for_lb
     timer_phase_end _T_NLB
 
     generate_mke4_yaml true    # airgap=true — uses hostname, caData
     mkectl_apply_on_bastion    # SCP mke4.yaml to bastion, run mkectl there
+    patch_coredns_hosts         # Resolve registry hostname directly in pods
     timer_phase_end _T_MKECTL
 
     print_airgap_deploy_summary
     export KUBECONFIG=/root/.mke/mke.kubeconf
+
+    prompt_mke4k_upgrade_prep_airgap
 }
 
 cmd_deploy_instances_airgap() {
@@ -1956,7 +2223,9 @@ cmd_deploy_instances_airgap() {
 cmd_deploy_registry() {
     load_config
     setup_registry
-    upload_mke4k_bundle
+    local upload_mode="standard"
+    [[ "${mke4k_version}" == "v4.1.3" ]] && upload_mode="dual-path"
+    upload_mke4k_bundle "${upload_mode}"
     success "Registry setup + bundle upload complete."
 }
 
@@ -1971,6 +2240,9 @@ cmd_deploy_cluster_airgap() {
     ensure_mkectl_on_bastion "${ssh_key}" "${bastion_ip}"
     generate_mke4_yaml true
     mkectl_apply_on_bastion
+    patch_coredns_hosts
+
+    prompt_mke4k_upgrade_prep_airgap
 }
 
 cmd_destroy_cluster_airgap() {
