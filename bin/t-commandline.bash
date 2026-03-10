@@ -1143,14 +1143,14 @@ patch_coredns_hosts() {
 \\t\\tfallthrough\\
 \\t}' /tmp/Corefile
 
-        # Apply patched configmap
+        # Replace the configmap in-place (avoids kubectl apply annotation warning)
         kubectl -n kube-system create configmap coredns --from-file=Corefile=/tmp/Corefile --dry-run=client -o yaml | \
-            kubectl apply -f -
+            kubectl replace -f -
         rm -f /tmp/Corefile
 
         # Restart CoreDNS to pick up changes
         kubectl -n kube-system rollout restart deployment coredns
-        kubectl -n kube-system rollout status deployment coredns --timeout=60s
+        kubectl -n kube-system rollout status deployment coredns --timeout=300s
 
         echo 'CoreDNS patched — registry hostname resolves directly in pods'
     "
