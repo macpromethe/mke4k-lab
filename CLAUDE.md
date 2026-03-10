@@ -115,11 +115,12 @@ Edit `config` before deploying. Key variables:
 1. `t deploy lab airgap` sources `config` → writes tfvars with `airgap_enabled=true`
 2. `terraform apply` provisions: dedicated VPC (172.31.0.0/16), public subnet (172.31.0.0/24) + private subnet (172.31.1.0/24), bastion EC2 in public subnet, controller/worker EC2s in private subnet (no internet), **internal** NLB in private subnet with IP-type target groups
 3. `setup_registry`: installs MCR (docker-ee) + bind9 + MSR4 (Harbor) on bastion; generates self-signed TLS cert (SAN=registry FQDN + bastion IP); creates Harbor project `mke`
-4. `upload_mke4k_bundle`: downloads MKE4k OCI bundle on bastion, uploads all images/charts to Harbor via containerised skopeo (`quay.io/skopeo/stable:v1.18.0`)
-5. `setup_node_dns`: configures each cluster node's systemd-resolved → bastion bind9 + `/etc/hosts` fallback for registry hostname
-6. `ensure_mkectl_on_bastion`: installs mkectl + kubectl on bastion
+4. `ensure_mkectl_on_bastion`: installs mkectl + kubectl on bastion (moved before bundle upload so mkectl is available for dual-path mode)
+5. `upload_mke4k_bundle`: downloads MKE4k OCI bundle on bastion, uploads all images/charts to Harbor via containerised skopeo (`quay.io/skopeo/stable:v1.18.0`). Supports `standard` (filesystem scan) and `dual-path` (v4.1.3 workaround) modes
+6. `setup_node_dns`: configures each cluster node's systemd-resolved → bastion bind9 + `/etc/hosts` fallback for registry hostname
 7. `generate_mke4_yaml true`: uses private IPs, bastion keypath, embeds registry CA via `caData`, sets `airgap.enabled=true`, forces `cloudProvider.enabled=false`
 8. `mkectl_apply_on_bastion`: SCPs mke4.yaml + SSH key to bastion, runs `mkectl apply` there, retrieves kubeconfig
+9. `prompt_mke4k_upgrade_prep_airgap`: interactive prompt to prepare MKE4k → MKE4k airgap upgrade (uploads target version bundle, downloads release-matrix.json, prints upgrade command)
 
 ### Deploy flow (MKE3 airgap)
 
@@ -173,7 +174,8 @@ Edit `config` before deploying. Key variables:
 - **CCM auto-disabled in airgap**: The AWS cloud controller manager requires access to `ec2.amazonaws.com` which is unreachable from the private subnet. `generate_mke4_yaml` forces `cloudProvider.enabled=false` when airgap=true
 - **DNS chain (airgap)**: cluster node → systemd-resolved → bastion bind9 → VPC DNS (172.31.0.2). Registry hostname (`registry.<cluster>.local`) is served by bind9; all other queries forwarded to VPC DNS. `/etc/hosts` fallback on all nodes for the registry hostname
 - **Registry TLS**: Self-signed cert with SAN covering both FQDN and bastion IP. CA embedded as `caData` in mke4.yaml; mkectl configures containerd trust on each node. Bastion has cert in `/etc/docker/certs.d/` for both FQDN and IP
-- **Bundle upload**: Containerised skopeo (`quay.io/skopeo/stable:v1.18.0`) with `--add-host` for DNS resolution inside the container. Filenames decoded: `&` → `/`, `@` → `:`
+- **Bundle upload**: Containerised skopeo (`quay.io/skopeo/stable:v1.18.0`) with `--add-host` for DNS resolution inside the container. Filenames decoded: `&` → `/`, `@` → `:`. Two modes: `standard` (filesystem scan, default) and `dual-path` (v4.1.3 workaround — uses `mkectl airgap list-images/list-charts` to enumerate artifacts, uploads `registry.mirantis.com/mke/*` images to both `<registry>/mke/<path>` and `<registry>/mke/mke/<path>` to work around mkectl v4.1.3's double-prefix bug)
+- **mkectl v4.1.3 dual-path workaround**: `mkectl upgrade` v4.1.3 double-prefixes multi-level image names during artifact presence check (e.g. `mke/mke/calico/apiserver` instead of `mke/calico/apiserver`). Workaround: upload images to both paths. Automatically activated when target version is v4.1.3 (for fresh installs and upgrade prep)
 - **Squid proxy (MKE3 airgap)**: Forward proxy on bastion port 3128. Cluster nodes use it for MCR APT package install (`get.mirantis.com`, `repos.mirantis.com`). ACL restricts to Mirantis/Docker/Ubuntu domains only. CONNECT tunnelling for HTTPS — no SSL bump
 - **MKE3 image path (airgap)**: `docker load` from tarball → retag `mirantis/*` → push to `registry.<cluster>.local/mke3/*`. Nodes pull via Docker with `/etc/docker/certs.d/<registry>/ca.crt` trust
 - **MKE3 NLB airgap-aware**: When `airgap_enabled`, MKE3 NLB is internal in private subnet (same as MKE4k NLB)
