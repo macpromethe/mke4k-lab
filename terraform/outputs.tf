@@ -47,3 +47,13 @@ output "worker_private_ips" {
   description = "Private IP addresses of worker nodes"
   value       = aws_instance.cluster-workers[*].private_ip
 }
+
+output "nfs_server_private_ip" {
+  description = "Private IP of the NFS server"
+  value       = var.nfs_enabled ? aws_instance.nfs_server[0].private_ip : ""
+}
+
+output "nfs_server_public_ip" {
+  description = "Public IP of the NFS server (empty in airgap mode)"
+  value       = var.nfs_enabled ? (var.airgap_enabled ? "" : aws_instance.nfs_server[0].public_ip) : ""
+}

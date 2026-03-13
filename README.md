@@ -133,6 +133,19 @@ This will:
 | `t deploy cluster mke3-airgap` | DNS + proxy + launchpad apply from bastion |
 | `t destroy cluster mke3-airgap` | Uninstall MKE3 from bastion (launchpad reset) |
 
+### NFS StorageClass (optional)
+
+| Command | Description |
+|---|---|
+| `t deploy nfs` | Setup NFS server + install CSI driver (cluster must exist) |
+| `t connect nfs` | SSH to NFS server (direct or via bastion in airgap) |
+
+Set `nfs_enabled=true` in `config` to automatically provision NFS during `t deploy lab` or `t deploy lab airgap`. Or use `t deploy nfs` to add NFS to an already-running cluster.
+
+Creates a dedicated NFS server EC2 instance, installs `nfs-common` on all cluster nodes, and deploys the [`nfs-subdir-external-provisioner`](https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner) Helm chart with a default `nfs-client` StorageClass.
+
+**Airgap support:** `.deb` packages are downloaded on the bastion and transferred via SCP. The provisioner image (`registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2`) is uploaded to a Harbor `nfs` project and the Helm chart is pulled on the bastion for offline install.
+
 ### Tunnels (airgap)
 
 | Command | Description |
@@ -149,6 +162,7 @@ This will:
 | `t status` | Show cluster node status (`kubectl get nodes`) |
 | `t show nodes` | Print IPs and NLB DNS name |
 | `t connect bastion` | SSH to bastion/registry host (airgap only) |
+| `t connect nfs` | SSH to NFS server (when `nfs_enabled=true`) |
 | `t connect m1` | SSH to controller-1 (via ProxyCommand when airgap) |
 | `t connect w1` | SSH to worker-1 |
 | `t connect <node> "cmd"` | Run a single command on a node |
@@ -171,8 +185,9 @@ mke4k-lab/
     ├── loadbalancer.tf           # MKE4k NLB + IP-type target groups + listeners
     ├── mke3_loadbalancer.tf      # MKE3 NLB (conditional on mke3_enabled)
     ├── airgap.tf                 # Bastion + private subnet (conditional on airgap_enabled)
+    ├── nfs.tf                    # NFS server EC2 (conditional on nfs_enabled)
     ├── iam.tf                    # IAM role + CCM policy + instance profile
-    └── outputs.tf                # lb_dns_name, IPs, ssh key path, bastion IPs
+    └── outputs.tf                # lb_dns_name, IPs, ssh key path, bastion IPs, NFS IPs
 ```
 
 ## What Terraform Creates
@@ -207,6 +222,12 @@ mke4k-lab/
 | `aws_instance` (bastion) | Public subnet, configurable size, runs MSR4 (Harbor) |
 | `aws_lb` (NLB) | Switched to **internal**, placed in private subnet |
 | Controllers + workers | Placed in the private subnet (no public IPs), CCM auto-disabled |
+
+### NFS mode (`nfs_enabled`)
+
+| Resource | Details |
+|---|---|
+| `aws_instance` (NFS server) | Public subnet (online) or private subnet (airgap). Runs `nfs-kernel-server` |
 
 ## After Deployment
 
@@ -276,6 +297,15 @@ t destroy lab
 | `airgap_msr_version` | `v4.13.3` | MSR4 (Harbor) offline installer version |
 | `mke4k_bundle_url` | *(auto)* | Override the MKE4k bundle download URL |
 | `mke3_bundle_url` | *(auto)* | Override the MKE3 image bundle download URL |
+
+### NFS settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `nfs_enabled` | `false` | Provisions NFS server EC2, installs nfs-common on nodes, deploys nfs-subdir-external-provisioner |
+| `nfs_flavor` | `t3.small` | EC2 instance type for the NFS server |
+| `nfs_disk_gb` | `50` | Root volume size (GB) for the NFS server |
+| `nfs_export_path` | `/srv/nfs/data` | NFS export path on the server |
 
 ## Airgap Architecture
 
