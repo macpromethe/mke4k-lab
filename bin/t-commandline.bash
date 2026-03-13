@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TERRAFORM_DIR="${PROJECT_ROOT}/terraform"
 CONFIG_FILE="${PROJECT_ROOT}/config"
-KUBECONFIG="${HOME}/.mke/mke.kubeconf"
+export KUBECONFIG="${HOME}/.mke/mke.kubeconf"
 
 # ---------------------------------------------------------------------------
 # Colors
@@ -44,6 +44,7 @@ _T_REGISTRY=0
 _T_BUNDLE=0
 _T_PROXY=0
 _T_MKE3_IMAGES=0
+_T_NFS=0
 
 timer_deploy_start() {
     _T_DEPLOY_START=$(date +%s)
@@ -107,6 +108,12 @@ load_config() {
     airgap_registry_disk_gb="${airgap_registry_disk_gb:-100}"
     airgap_msr_version="${airgap_msr_version:-v4.13.3}"
     registry_hostname="registry.${cluster_name}.local"
+
+    # NFS defaults
+    nfs_enabled="${nfs_enabled:-false}"
+    nfs_flavor="${nfs_flavor:-t3.small}"
+    nfs_disk_gb="${nfs_disk_gb:-50}"
+    nfs_export_path="${nfs_export_path:-/srv/nfs/data}"
 }
 
 write_tfvars() {
@@ -128,6 +135,9 @@ mke3_enabled             = ${mke3_enabled}
 airgap_enabled           = ${airgap_enabled}
 airgap_registry_flavor   = "${airgap_registry_flavor}"
 airgap_registry_disk_gb  = ${airgap_registry_disk_gb}
+nfs_enabled              = ${nfs_enabled}
+nfs_flavor               = "${nfs_flavor}"
+nfs_disk_gb              = ${nfs_disk_gb}
 EOF
     info "Wrote terraform/terraform.tfvars"
 }
@@ -1093,11 +1103,19 @@ mkectl_apply_on_bastion() {
     scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" "${ssh_key}" "ubuntu@${bastion_ip}:~/aws_private.pem"
     ssh_node "${ssh_key}" "${bastion_ip}" "chmod 600 ~/aws_private.pem"
 
+    # Clear known_hosts on bastion to avoid host key mismatch with mkectl
+    # (prior SSH via ProxyCommand may have cached keys with different hashing)
+    ssh_node "${ssh_key}" "${bastion_ip}" "rm -f ~/.ssh/known_hosts"
+
     local debug_flag=""
     [[ "${debug:-false}" == "true" ]] && debug_flag="-l debug"
 
+    # v4.1.3 airgap: skip TLS verify for registry (workaround for self-signed cert issue)
+    local tls_skip_flag=""
+    [[ "${mke4k_version}" == "v4.1.3" ]] && tls_skip_flag="--registry-insecure-skip-tls-verify"
+
     info "Running mkectl apply on bastion (airgap mode)..."
-    ssh_node "${ssh_key}" "${bastion_ip}" "mkectl ${debug_flag} apply -f ~/mke4.yaml"
+    ssh_node "${ssh_key}" "${bastion_ip}" "mkectl ${debug_flag} apply -f ~/mke4.yaml ${tls_skip_flag}"
 
     # SCP kubeconfig back
     info "Retrieving kubeconfig from bastion..."
@@ -1154,6 +1172,321 @@ patch_coredns_hosts() {
 
         echo 'CoreDNS patched — registry hostname resolves directly in pods'
     "
+}
+
+# ---------------------------------------------------------------------------
+# NFS — server setup, client install, provisioner deploy
+# ---------------------------------------------------------------------------
+setup_nfs_server() {
+    local output ssh_key nfs_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+
+    local bastion_ip=""
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    local is_airgap=false
+    [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" && "${bastion_ip}" != "" ]] && is_airgap=true
+
+    if [[ "${is_airgap}" == "true" ]]; then
+        nfs_ip="$(echo "${output}" | jq -r '.nfs_server_private_ip.value')"
+    else
+        nfs_ip="$(echo "${output}" | jq -r '.nfs_server_public_ip.value')"
+    fi
+
+    [[ -z "${nfs_ip}" || "${nfs_ip}" == "null" || "${nfs_ip}" == "" ]] \
+        && die "NFS server IP not found. Was terraform applied with nfs_enabled=true?"
+
+    info "Setting up NFS server (${nfs_ip})..."
+
+    if [[ "${is_airgap}" == "true" ]]; then
+        # Airgap: download .deb packages on bastion, transfer to NFS server
+        wait_for_ssh "${ssh_key}" "${bastion_ip}" "bastion"
+        # Ensure SSH key is on bastion for SCP to private-subnet nodes
+        scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" "${ssh_key}" "ubuntu@${bastion_ip}:~/aws_private.pem"
+        info "  Downloading NFS server packages on bastion..."
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+            set -euo pipefail
+            if [[ -d /tmp/nfs-server-debs ]]; then
+                echo 'NFS server packages already downloaded'
+                exit 0
+            fi
+            mkdir -p /tmp/nfs-server-debs
+            cd /tmp/nfs-server-debs
+            sudo apt-get update -qq
+            apt-get download \$(apt-cache depends --recurse --no-recommends --no-suggests \
+                --no-conflicts --no-breaks --no-replaces --no-enhances \
+                nfs-kernel-server | grep '^\w' | sort -u) 2>/dev/null || true
+            echo \"Downloaded \$(ls *.deb 2>/dev/null | wc -l) packages\"
+        "
+
+        info "  Transferring packages to NFS server..."
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+            set -euo pipefail
+            tar czf /tmp/nfs-server-debs.tar.gz -C /tmp nfs-server-debs
+            scp -q -o StrictHostKeyChecking=no -i ~/aws_private.pem \
+                /tmp/nfs-server-debs.tar.gz ubuntu@${nfs_ip}:/tmp/
+        "
+
+        # Make sure we can reach the NFS server via bastion
+        info "  Installing NFS server packages..."
+        ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${nfs_ip}" "
+            set -euo pipefail
+            if dpkg -l nfs-kernel-server 2>/dev/null | grep -q '^ii'; then
+                echo 'nfs-kernel-server already installed'
+            else
+                cd /tmp
+                tar xzf nfs-server-debs.tar.gz
+                sudo dpkg -i --force-depends nfs-server-debs/*.deb 2>/dev/null || true
+                rm -rf nfs-server-debs nfs-server-debs.tar.gz
+            fi
+            sudo mkdir -p ${nfs_export_path}
+            sudo chown nobody:nogroup ${nfs_export_path}
+            sudo chmod 755 ${nfs_export_path}
+            echo '${nfs_export_path}    *(rw,sync,no_root_squash,no_subtree_check)' | sudo tee /etc/exports >/dev/null
+            sudo exportfs -ra
+            sudo systemctl enable --now nfs-kernel-server
+            echo 'NFS server ready'
+        "
+    else
+        # Online: direct SSH
+        wait_for_ssh "${ssh_key}" "${nfs_ip}" "nfs-server"
+        ssh_node "${ssh_key}" "${nfs_ip}" "
+            set -euo pipefail
+            if dpkg -l nfs-kernel-server 2>/dev/null | grep -q '^ii'; then
+                echo 'nfs-kernel-server already installed'
+            else
+                sudo apt-get update -qq
+                sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-kernel-server >/dev/null 2>&1
+            fi
+            sudo mkdir -p ${nfs_export_path}
+            sudo chown nobody:nogroup ${nfs_export_path}
+            sudo chmod 755 ${nfs_export_path}
+            echo '${nfs_export_path}    *(rw,sync,no_root_squash,no_subtree_check)' | sudo tee /etc/exports >/dev/null
+            sudo exportfs -ra
+            sudo systemctl enable --now nfs-kernel-server
+            echo 'NFS server ready'
+        "
+    fi
+    success "NFS server configured (export: ${nfs_export_path})."
+}
+
+install_nfs_client_on_nodes() {
+    local output ssh_key
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+
+    local bastion_ip=""
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    local is_airgap=false
+    [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" && "${bastion_ip}" != "" ]] && is_airgap=true
+
+    local all_ips=()
+    if [[ "${is_airgap}" == "true" ]]; then
+        mapfile -t all_ips < <(echo "${output}" | jq -r '.controller_private_ips.value[], .worker_private_ips.value[]' 2>/dev/null)
+    else
+        mapfile -t all_ips < <(echo "${output}" | jq -r '.controller_ips.value[], .worker_ips.value[]' 2>/dev/null)
+    fi
+
+    [[ ${#all_ips[@]} -eq 0 ]] && { warn "No cluster nodes found — skipping NFS client install."; return; }
+
+    info "Installing nfs-common on ${#all_ips[@]} cluster node(s)..."
+
+    if [[ "${is_airgap}" == "true" ]]; then
+        # Download nfs-common packages on bastion
+        info "  Downloading nfs-common packages on bastion..."
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+            set -euo pipefail
+            if [[ -d /tmp/nfs-client-debs ]]; then
+                echo 'NFS client packages already downloaded'
+                exit 0
+            fi
+            mkdir -p /tmp/nfs-client-debs
+            cd /tmp/nfs-client-debs
+            sudo apt-get update -qq
+            apt-get download \$(apt-cache depends --recurse --no-recommends --no-suggests \
+                --no-conflicts --no-breaks --no-replaces --no-enhances \
+                nfs-common | grep '^\w' | sort -u) 2>/dev/null || true
+            tar czf /tmp/nfs-client-debs.tar.gz -C /tmp nfs-client-debs
+            echo \"Downloaded \$(ls *.deb 2>/dev/null | wc -l) packages\"
+        "
+
+        for node_ip in "${all_ips[@]}"; do
+            info "  nfs-common → ${node_ip}"
+            ssh_node "${ssh_key}" "${bastion_ip}" "
+                scp -q -o StrictHostKeyChecking=no -i ~/aws_private.pem \
+                    /tmp/nfs-client-debs.tar.gz ubuntu@${node_ip}:/tmp/
+            "
+            ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "
+                set -euo pipefail
+                if dpkg -l nfs-common 2>/dev/null | grep -q '^ii'; then
+                    echo 'nfs-common already installed'
+                    exit 0
+                fi
+                cd /tmp
+                tar xzf nfs-client-debs.tar.gz
+                sudo dpkg -i --force-depends nfs-client-debs/*.deb 2>/dev/null || true
+                rm -rf nfs-client-debs nfs-client-debs.tar.gz
+            "
+        done
+    else
+        for node_ip in "${all_ips[@]}"; do
+            info "  nfs-common → ${node_ip}"
+            ssh_node "${ssh_key}" "${node_ip}" "
+                set -euo pipefail
+                if dpkg -l nfs-common 2>/dev/null | grep -q '^ii'; then
+                    echo 'nfs-common already installed'
+                    exit 0
+                fi
+                sudo apt-get update -qq
+                sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-common >/dev/null 2>&1
+            "
+        done
+    fi
+    success "nfs-common installed on all cluster nodes."
+}
+
+deploy_nfs_provisioner() {
+    local output nfs_private_ip
+    output="$(tf_output)"
+    nfs_private_ip="$(echo "${output}" | jq -r '.nfs_server_private_ip.value')"
+
+    [[ -z "${nfs_private_ip}" || "${nfs_private_ip}" == "null" || "${nfs_private_ip}" == "" ]] \
+        && die "NFS server private IP not found."
+
+    info "Deploying nfs-subdir-external-provisioner (online)..."
+    helm repo add nfs-subdir-external-provisioner \
+        https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ 2>/dev/null || true
+    helm repo update nfs-subdir-external-provisioner
+
+    helm install nfs-subdir-external-provisioner \
+        nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+        --set nfs.server="${nfs_private_ip}" \
+        --set nfs.path="${nfs_export_path}" \
+        --wait --timeout 300s 2>/dev/null \
+    || {
+        # Already installed? Try upgrade instead
+        helm upgrade nfs-subdir-external-provisioner \
+            nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+            --set nfs.server="${nfs_private_ip}" \
+            --set nfs.path="${nfs_export_path}" \
+            --wait --timeout 300s
+    }
+
+    kubectl patch storageclass nfs-client \
+        -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+    success "NFS StorageClass 'nfs-client' deployed and set as default."
+}
+
+upload_nfs_provisioner_image() {
+    local output ssh_key bastion_ip bastion_private_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    bastion_private_ip="$(echo "${output}" | jq -r '.bastion_private_ip.value')"
+
+    local creds_file="${TERRAFORM_DIR}/registry_credentials.txt"
+    [[ -f "${creds_file}" ]] || die "Registry credentials not found. Run 't deploy registry' first."
+    local registry_pass
+    registry_pass="$(grep '^password=' "${creds_file}" | cut -d= -f2)"
+
+    local reg_host="${registry_hostname}"
+    local nfs_image="registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2"
+
+    info "Uploading NFS provisioner image to registry..."
+
+    ssh_node "${ssh_key}" "${bastion_ip}" "
+        set -euo pipefail
+
+        # Create 'nfs' project in Harbor
+        if ! curl -sk -u 'admin:${registry_pass}' \
+                'https://${reg_host}/api/v2.0/projects?name=nfs' | grep -q '\"name\":\"nfs\"'; then
+            curl -sk -u 'admin:${registry_pass}' \
+                -X POST 'https://${reg_host}/api/v2.0/projects' \
+                -H 'Content-Type: application/json' \
+                -d '{\"project_name\":\"nfs\",\"public\":true}' || true
+            echo 'Created Harbor project: nfs'
+        else
+            echo 'Harbor project nfs already exists'
+        fi
+
+        # Copy image via skopeo
+        echo '>>> Copying NFS provisioner image...'
+        docker run --rm \
+            --add-host '${reg_host}:${bastion_private_ip}' \
+            -v /etc/docker/certs.d/${reg_host}/ca.crt:/etc/docker/certs.d/${reg_host}/ca.crt:ro \
+            quay.io/skopeo/stable:v1.18.0 copy \
+                --dest-tls-verify=false \
+                --dest-creds 'admin:${registry_pass}' \
+                'docker://${nfs_image}' \
+                'docker://${reg_host}/nfs/nfs-subdir-external-provisioner:v4.0.2'
+        echo 'NFS provisioner image uploaded'
+
+        # Install helm if not present
+        if ! command -v helm &>/dev/null; then
+            echo '>>> Installing helm...'
+            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        fi
+
+        # Pull chart for offline install
+        CHART_DIR=~/nfs-provisioner-chart
+        if [[ ! -d \"\${CHART_DIR}/nfs-subdir-external-provisioner\" ]]; then
+            echo '>>> Pulling NFS provisioner chart...'
+            helm repo add nfs-subdir-external-provisioner \
+                https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/ 2>/dev/null || true
+            helm repo update nfs-subdir-external-provisioner
+            mkdir -p \"\${CHART_DIR}\"
+            helm pull nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+                --untar --untardir \"\${CHART_DIR}\"
+        else
+            echo 'Chart already pulled'
+        fi
+    "
+    success "NFS provisioner image + chart ready on bastion."
+}
+
+deploy_nfs_provisioner_airgap() {
+    local output ssh_key bastion_ip nfs_private_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    nfs_private_ip="$(echo "${output}" | jq -r '.nfs_server_private_ip.value')"
+
+    [[ -z "${nfs_private_ip}" || "${nfs_private_ip}" == "null" || "${nfs_private_ip}" == "" ]] \
+        && die "NFS server private IP not found."
+
+    local reg_host="${registry_hostname}"
+
+    info "Deploying nfs-subdir-external-provisioner (airgap, from bastion)..."
+
+    ssh_node "${ssh_key}" "${bastion_ip}" "
+        set -euo pipefail
+        export KUBECONFIG=~/.mke/mke.kubeconf
+
+        CHART_DIR=~/nfs-provisioner-chart/nfs-subdir-external-provisioner
+        [[ -d \"\${CHART_DIR}\" ]] || { echo 'ERROR: Chart not found. Run upload_nfs_provisioner_image first.'; exit 1; }
+
+        helm install nfs-subdir-external-provisioner \"\${CHART_DIR}\" \
+            --set nfs.server='${nfs_private_ip}' \
+            --set nfs.path='${nfs_export_path}' \
+            --set image.repository='${reg_host}/nfs/nfs-subdir-external-provisioner' \
+            --set image.tag='v4.0.2' \
+            --wait --timeout 300s 2>/dev/null \
+        || {
+            helm upgrade nfs-subdir-external-provisioner \"\${CHART_DIR}\" \
+                --set nfs.server='${nfs_private_ip}' \
+                --set nfs.path='${nfs_export_path}' \
+                --set image.repository='${reg_host}/nfs/nfs-subdir-external-provisioner' \
+                --set image.tag='v4.0.2' \
+                --wait --timeout 300s
+        }
+
+        kubectl patch storageclass nfs-client \
+            -p '{\"metadata\":{\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'
+
+        echo 'NFS StorageClass nfs-client deployed and set as default'
+    "
+    success "NFS StorageClass 'nfs-client' deployed (airgap)."
 }
 
 # ---------------------------------------------------------------------------
@@ -1551,6 +1884,9 @@ prompt_upgrade_prep_airgap() {
             echo "      --chart-registry-ca-file=${ca_path} \\"
             echo "      --mke3-airgapped=true \\"
             echo "      --config ~/mke4.yaml \\"
+            if [[ "${target}" == "v4.1.3" ]]; then
+                echo "      --registry-insecure-skip-tls-verify \\"
+            fi
             echo "      --force${debug_flag:+ \\}"
             [[ -n "${debug_flag}" ]] && echo "      ${debug_flag}"
             echo ""
@@ -1607,12 +1943,19 @@ prompt_mke4k_upgrade_prep_airgap() {
             local debug_flag=""
             [[ "${debug:-false}" == "true" ]] && debug_flag="-l debug"
 
+            # v4.1.3: add --registry-insecure-skip-tls-verify (self-signed cert workaround)
+            local tls_skip_flag=""
+            [[ "${target}" == "v4.1.3" ]] && tls_skip_flag="--registry-insecure-skip-tls-verify"
+
             echo ""
             echo -e "  ${BOLD}To upgrade MKE4k, SSH to bastion and run:${RESET}"
             echo ""
             echo -e "    ${CYAN}mkectl upgrade${RESET} \\"
             echo "      --upgrade-version ${target} \\"
-            echo "      --release-matrix ~/release-matrix.json${debug_flag:+ \\}"
+            echo "      --release-matrix ~/release-matrix.json${tls_skip_flag:+ \\}"
+            if [[ -n "${tls_skip_flag}" ]]; then
+                echo "      ${tls_skip_flag}${debug_flag:+ \\}"
+            fi
             [[ -n "${debug_flag}" ]] && echo "      ${debug_flag}"
             echo ""
 
@@ -1676,6 +2019,19 @@ resolve_node() {
         return 0
     fi
 
+    # nfs → NFS server IP
+    if [[ "${name}" == "nfs" ]]; then
+        local nfs_ip
+        if [[ "${is_airgap}" == "true" ]]; then
+            nfs_ip="$(echo "${output}" | jq -r '.nfs_server_private_ip.value // empty')"
+        else
+            nfs_ip="$(echo "${output}" | jq -r '.nfs_server_public_ip.value // empty')"
+        fi
+        [[ -n "${nfs_ip}" && "${nfs_ip}" != "" ]] || die "No NFS server found."
+        echo "${nfs_ip}"
+        return 0
+    fi
+
     # Choose IP field based on airgap mode
     local ctrl_field="controller_ips" wkr_field="worker_ips"
     if [[ "${is_airgap}" == "true" ]]; then
@@ -1711,6 +2067,7 @@ ${BOLD}Usage:${RESET}
 
 ${BOLD}Node names:${RESET}
   bastion            bastion/registry host (airgap)
+  nfs                NFS server (when nfs_enabled=true)
   m1, m2, m3, …     controllers (managers)
   w1, w2, w3, …     workers
   <ip>               any raw IP or hostname
@@ -1771,9 +2128,12 @@ print_deploy_summary() {
     mapfile -t controller_ips < <(echo "${output}" | jq -r '.controller_ips.value[]' 2>/dev/null)
     mapfile -t worker_ips     < <(echo "${output}" | jq -r '.worker_ips.value[]'     2>/dev/null)
 
-    local total=$(( _T_TERRAFORM + _T_NLB + _T_MKECTL ))
+    local total=$(( _T_TERRAFORM + _T_NLB + _T_MKECTL + _T_NFS ))
     local ccm_str="CCM disabled"
     [[ "${ccm_enabled:-false}" == "true" ]] && ccm_str="CCM enabled"
+
+    local nfs_priv_ip=""
+    nfs_priv_ip="$(echo "${output}" | jq -r '.nfs_server_private_ip.value // empty' 2>/dev/null)"
 
     local W=58
     local SEP; SEP="$(printf '═%.0s' $(seq 1 ${W}))"
@@ -1793,11 +2153,17 @@ print_deploy_summary() {
     sep
     bline "$(printf '  %-12s %-20s %s' 'Cluster' "${cluster_name}" "${region}")"
     bline "$(printf '  %-12s %-20s %s' 'MKE4k' "${mke4k_version}" "${ccm_str}")"
+    if [[ -n "${nfs_priv_ip}" && "${nfs_priv_ip}" != "" ]]; then
+        bline "$(printf '  %-12s %s' 'NFS' "${nfs_priv_ip} (${nfs_export_path})")"
+    fi
     sep
     bline "  Timing"
     bline "$(printf '    %-22s %s' 'Terraform'     "$(fmt_duration ${_T_TERRAFORM})")"
     bline "$(printf '    %-22s %s' 'NLB stabilise' "$(fmt_duration ${_T_NLB})")"
     bline "$(printf '    %-22s %s' 'MKE4k install' "$(fmt_duration ${_T_MKECTL})")"
+    if [[ ${_T_NFS} -gt 0 ]]; then
+        bline "$(printf '    %-22s %s' 'NFS setup'     "$(fmt_duration ${_T_NFS})")"
+    fi
     bline "    ${HDIV}"
     bline "$(printf '    %-22s %s' 'Total'         "$(fmt_duration ${total})")"
     sep
@@ -1932,7 +2298,10 @@ print_airgap_deploy_summary() {
     local registry_pass
     registry_pass="$(grep '^password=' "${creds_file}" 2>/dev/null | cut -d= -f2 || echo "(unknown)")"
 
-    local total=$(( _T_TERRAFORM + _T_REGISTRY + _T_BUNDLE + _T_NLB + _T_MKECTL ))
+    local total=$(( _T_TERRAFORM + _T_REGISTRY + _T_BUNDLE + _T_NLB + _T_MKECTL + _T_NFS ))
+
+    local nfs_priv_ip=""
+    nfs_priv_ip="$(echo "${output}" | jq -r '.nfs_server_private_ip.value // empty' 2>/dev/null)"
 
     local W=58
     local SEP; SEP="$(printf '═%.0s' $(seq 1 ${W}))"
@@ -1955,6 +2324,9 @@ print_airgap_deploy_summary() {
     bline "$(printf '  %-18s %s' 'Workers' "${worker_count}")"
     bline "$(printf '  %-18s %s' 'Registry' "MSR4 ${airgap_msr_version}")"
     bline "$(printf '  %-18s %s' 'Airgap' 'true')"
+    if [[ -n "${nfs_priv_ip}" && "${nfs_priv_ip}" != "" ]]; then
+        bline "$(printf '  %-18s %s' 'NFS' "${nfs_priv_ip} (${nfs_export_path})")"
+    fi
     sep
     bline "$(printf '  %-18s %s' 'Bastion (public)' "${bastion_pub_ip}")"
     bline "$(printf '  %-18s %s' 'Registry host' "${registry_hostname}")"
@@ -1968,6 +2340,9 @@ print_airgap_deploy_summary() {
     bline "$(printf '    %-22s %s' 'Bundle upload'   "$(fmt_duration ${_T_BUNDLE})")"
     bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
     bline "$(printf '    %-22s %s' 'mkectl apply'    "$(fmt_duration ${_T_MKECTL})")"
+    if [[ ${_T_NFS} -gt 0 ]]; then
+        bline "$(printf '    %-22s %s' 'NFS setup'       "$(fmt_duration ${_T_NFS})")"
+    fi
     bline "    ${HDIV}"
     bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
     sep
@@ -2106,6 +2481,12 @@ cmd_deploy_lab_mke4() {
     generate_mke4_yaml
     mkectl_apply
     timer_phase_end _T_MKECTL
+    if [[ "${nfs_enabled}" == "true" ]]; then
+        setup_nfs_server
+        install_nfs_client_on_nodes
+        deploy_nfs_provisioner
+        timer_phase_end _T_NFS
+    fi
     print_deploy_summary
     export KUBECONFIG=/root/.mke/mke.kubeconf
 }
@@ -2195,6 +2576,12 @@ cmd_deploy_lab_airgap() {
     upload_mke4k_bundle "${upload_mode}"
     timer_phase_end _T_BUNDLE
 
+    if [[ "${nfs_enabled}" == "true" ]]; then
+        setup_nfs_server
+        install_nfs_client_on_nodes
+        upload_nfs_provisioner_image
+    fi
+
     setup_node_dns             # Point each node's systemd-resolved at bastion
 
     wait_for_lb
@@ -2204,6 +2591,11 @@ cmd_deploy_lab_airgap() {
     mkectl_apply_on_bastion    # SCP mke4.yaml to bastion, run mkectl there
     patch_coredns_hosts         # Resolve registry hostname directly in pods
     timer_phase_end _T_MKECTL
+
+    if [[ "${nfs_enabled}" == "true" ]]; then
+        deploy_nfs_provisioner_airgap
+        timer_phase_end _T_NFS
+    fi
 
     print_airgap_deploy_summary
     export KUBECONFIG=/root/.mke/mke.kubeconf
@@ -2344,6 +2736,29 @@ cmd_destroy_lab() {
     success "Lab destroyed."
 }
 
+cmd_deploy_nfs() {
+    load_config
+    [[ "${nfs_enabled}" == "true" ]] || die "nfs_enabled is not true in config"
+
+    local output
+    output="$(tf_output 2>/dev/null)" || die "Could not read terraform output. Has terraform been applied?"
+
+    local bastion_ip=""
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    local is_airgap=false
+    [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" && "${bastion_ip}" != "" ]] && is_airgap=true
+
+    setup_nfs_server
+    install_nfs_client_on_nodes
+    if [[ "${is_airgap}" == "true" ]]; then
+        upload_nfs_provisioner_image
+        deploy_nfs_provisioner_airgap
+    else
+        deploy_nfs_provisioner
+    fi
+    success "NFS setup complete."
+}
+
 cmd_status() {
     local kc="${KUBECONFIG}"
     if [[ ! -f "${kc}" ]]; then
@@ -2401,6 +2816,20 @@ cmd_show_nodes() {
         echo "${worker_ips}" | while read -r ip; do
             echo "  ${ip}   ssh -i ${ssh_key} ubuntu@${ip}"
         done
+    fi
+
+    # NFS server
+    local nfs_priv_ip nfs_pub_ip
+    nfs_priv_ip="$(echo "${output}" | jq -r '.nfs_server_private_ip.value // empty' 2>/dev/null)"
+    nfs_pub_ip="$(echo "${output}" | jq -r '.nfs_server_public_ip.value // empty' 2>/dev/null)"
+    if [[ -n "${nfs_priv_ip}" && "${nfs_priv_ip}" != "" ]]; then
+        echo -e "\n${BOLD}NFS Server:${RESET}"
+        if [[ "${is_airgap}" == "true" ]]; then
+            echo "  ${nfs_priv_ip} (private)  t connect nfs  (via bastion ProxyJump)"
+        else
+            echo "  ${nfs_pub_ip} (public)   t connect nfs"
+            echo "  ${nfs_priv_ip} (private)"
+        fi
     fi
 
     echo -e "\n${BOLD}MKE4k Load Balancer:${RESET}"
@@ -2516,6 +2945,7 @@ usage() {
     echo "  deploy cluster mke3-airgap  Install MKE3 from bastion (airgap + proxy)"
     echo "  deploy registry             Setup MSR4 + upload MKE4k bundle"
     echo "  deploy registry mke3        Setup MSR4 + upload MKE3 images"
+    echo "  deploy nfs                  Setup NFS server + CSI driver (cluster must exist)"
     echo "  destroy cluster             Uninstall MKE4k (mkectl reset)"
     echo "  destroy cluster mke3        Uninstall MKE3 (launchpad reset)"
     echo "  destroy cluster airgap      Uninstall MKE4k from bastion"
@@ -2524,6 +2954,7 @@ usage() {
     echo "  status                      Show cluster node status (kubectl get nodes)"
     echo "  show nodes                  Print controller/worker IPs and load balancer DNS"
     echo "  connect bastion             SSH to bastion/registry host (airgap)"
+    echo "  connect nfs                 SSH to NFS server (when nfs_enabled=true)"
     echo "  connect <node>              SSH into a node (m1/m2/m3, w1/w2/w3, or raw IP)"
     echo "  connect <node> cmd          Run a single command on a node and return"
     echo "  tunnel                      Show available SSH tunnels for airgap UIs"
@@ -2581,7 +3012,8 @@ case "${COMMAND}" in
                     *)           die "Unknown variant: t deploy registry ${3}. Try: mke4, mke3" ;;
                 esac
                 ;;
-            *)         die "Unknown subcommand: t deploy ${SUBCOMMAND}. Try: lab, instances, cluster, registry" ;;
+            nfs) cmd_deploy_nfs ;;
+            *)         die "Unknown subcommand: t deploy ${SUBCOMMAND}. Try: lab, instances, cluster, registry, nfs" ;;
         esac
         ;;
     destroy)

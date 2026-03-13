@@ -88,3 +88,20 @@ airgap_msr_version="v4.13.3"
 # Override the MKE3 image bundle download URL.
 # Default: https://packages.mirantis.com/caas/ucp_images_<mke3_version>.tar.gz
 # mke3_bundle_url=""
+
+# ============================================================
+#  NFS settings   (optional — works with all deploy modes)
+# ============================================================
+# true  -> provisions a dedicated NFS server EC2, installs nfs-common on
+#          all cluster nodes, and deploys the nfs-subdir-external-provisioner + default StorageClass.
+# false -> no NFS resources created (default).
+nfs_enabled=false
+
+# EC2 instance type for the NFS server.
+nfs_flavor="t3.small"
+
+# Root volume size in GB for the NFS server.
+nfs_disk_gb=50
+
+# NFS export path on the server.
+nfs_export_path="/srv/nfs/data"

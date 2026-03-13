@@ -67,3 +67,21 @@ variable "airgap_registry_disk_gb" {
   default     = 100
   description = "Root volume size in GB for the bastion/registry host"
 }
+
+variable "nfs_enabled" {
+  type        = bool
+  default     = false
+  description = "When true, provision a dedicated NFS server EC2 instance"
+}
+
+variable "nfs_flavor" {
+  type        = string
+  default     = "t3.small"
+  description = "EC2 instance type for the NFS server"
+}
+
+variable "nfs_disk_gb" {
+  type        = number
+  default     = 50
+  description = "Root volume size in GB for the NFS server"
+}
