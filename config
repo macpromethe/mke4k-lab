@@ -90,7 +90,7 @@ airgap_msr_version="v4.13.3"
 # mke3_bundle_url=""
 
 # ============================================================
-#  NFS settings   (optional — works with all deploy modes)
+#  NFS settings   (optional - works with all deploy modes)
 # ============================================================
 # true  -> provisions a dedicated NFS server EC2, installs nfs-common on
 #          all cluster nodes, and deploys the nfs-subdir-external-provisioner + default StorageClass.

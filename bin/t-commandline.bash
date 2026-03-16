@@ -2268,6 +2268,9 @@ print_mke3_deploy_summary() {
     echo -e "  ${BOLD}MKE3 UI${RESET}"
     echo -e "    https://${mke3_lb_dns}"
     echo ""
+    echo -e "  ${BOLD}Client bundle:${RESET}"
+    echo -e "    ${CYAN}t gen client-bundle${RESET}    (downloads certs + sets KUBECONFIG)"
+    echo ""
     echo -e "  ${BOLD}To upgrade to MKE4k:${RESET}"
     echo -e "    ${CYAN}mkectl upgrade${RESET} \\"
     echo -e "      --hosts-path ${nodes_yaml} \\"
@@ -2463,6 +2466,7 @@ print_mke3_airgap_deploy_summary() {
     echo -e "  ${BOLD}Tunnels:${RESET}   t tunnel mke3          → https://localhost:3000"
     echo -e "             t tunnel registry      → https://localhost:8443"
     echo -e "             t tunnel               (show all + manual commands)"
+    echo -e "  ${BOLD}Bundle:${RESET}    t gen client-bundle    (downloads certs + sets KUBECONFIG)"
     echo ""
 }
 
@@ -2924,6 +2928,72 @@ cmd_tunnel() {
 # ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Client bundle
+# ---------------------------------------------------------------------------
+
+cmd_gen_client_bundle() {
+    load_config
+
+    local output ssh_key bastion_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+
+    # Detect airgap
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    local is_airgap=false
+    [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" && "${bastion_ip}" != "" ]] && is_airgap=true
+
+    # MKE4k — just print kubeconfig path
+    if [[ "${1:-mke3}" != "mke3" ]]; then
+        info "MKE4k kubeconfig is at: ${HOME}/.mke/mke.kubeconf"
+        info "Usage: export KUBECONFIG=${HOME}/.mke/mke.kubeconf"
+        return 0
+    fi
+
+    # MKE3 — generate client bundle
+    local launchpad_yaml="${TERRAFORM_DIR}/launchpad.yaml"
+
+    if [[ "${is_airgap}" == "true" ]]; then
+        # Airgap: run on bastion
+        info "Generating MKE3 client bundle on bastion (airgap)..."
+        ssh_node "${ssh_key}" "${bastion_ip}" "launchpad client-config -a -c ~/launchpad.yaml"
+
+        # Find the bundle directory on bastion
+        local bundle_dir
+        bundle_dir="$(ssh_node "${ssh_key}" "${bastion_ip}" "ls -d /home/ubuntu/.mirantis-launchpad/cluster/*/bundle/admin 2>/dev/null | head -1")"
+        [[ -n "${bundle_dir}" ]] || die "Client bundle not found on bastion."
+
+        # Source env.sh on bastion and print KUBECONFIG info
+        info "Client bundle downloaded to bastion: ${bundle_dir}"
+        info "To use it, SSH to bastion and run:"
+        echo ""
+        echo "  t connect bastion"
+        echo "  cd ${bundle_dir}"
+        echo "  source env.sh"
+        echo "  kubectl get nodes"
+        echo ""
+    else
+        # Online: run locally
+        [[ -f "${launchpad_yaml}" ]] || die "launchpad.yaml not found. Deploy MKE3 first."
+        ensure_launchpad
+        info "Generating MKE3 client bundle..."
+        launchpad client-config -a -c "${launchpad_yaml}"
+
+        # Find the bundle directory
+        local bundle_dir
+        bundle_dir="$(ls -d ${HOME}/.mirantis-launchpad/cluster/*/bundle/admin 2>/dev/null | head -1)"
+        [[ -n "${bundle_dir}" ]] || die "Client bundle not found."
+
+        success "Client bundle downloaded to: ${bundle_dir}"
+        echo ""
+        echo "  To activate, run:"
+        echo ""
+        echo "    cd ${bundle_dir} && source env.sh"
+        echo ""
+    fi
+}
+
 usage() {
     echo ""
     echo -e "${BOLD}mke4k-lab — t CLI${RESET}"
@@ -2957,6 +3027,8 @@ usage() {
     echo "  connect nfs                 SSH to NFS server (when nfs_enabled=true)"
     echo "  connect <node>              SSH into a node (m1/m2/m3, w1/w2/w3, or raw IP)"
     echo "  connect <node> cmd          Run a single command on a node and return"
+    echo "  gen client-bundle [mke3]    Download MKE3 client bundle (default)"
+    echo "  gen client-bundle mke4      Show MKE4k kubeconfig path"
     echo "  tunnel                      Show available SSH tunnels for airgap UIs"
     echo "  tunnel dashboard            MKE4k Dashboard → https://localhost:3000"
     echo "  tunnel mke3                 MKE3 Dashboard  → https://localhost:3000"
@@ -3039,6 +3111,12 @@ case "${COMMAND}" in
         esac
         ;;
     connect) cmd_connect "${SUBCOMMAND}" "${3:-}" ;;
+    gen)
+        case "${SUBCOMMAND}" in
+            client-bundle) cmd_gen_client_bundle "${3:-mke3}" ;;
+            *)             die "Unknown subcommand: t gen ${SUBCOMMAND}. Try: client-bundle" ;;
+        esac
+        ;;
     tunnel)  cmd_tunnel "${SUBCOMMAND}" ;;
     help|--help|-h|"") usage ;;
     *) die "Unknown command: ${COMMAND}. Run 't help' for usage." ;;
