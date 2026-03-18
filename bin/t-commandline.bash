@@ -401,13 +401,30 @@ RESOLVEOF
         mkdir -p ~/msr && tar -xzf msr.tar.gz -C ~/msr --strip-components=1
         rm msr.tar.gz
 
-        echo '>>> Generating TLS cert (SAN=DNS:${reg_host},IP:${bastion_private_ip})...'
+        echo '>>> Generating two-tier TLS PKI (CA + server cert)...'
         mkdir -p ~/msr/certs
+
+        # 1. Generate CA key + self-signed CA cert (CA:TRUE, no SANs)
         openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
+            -keyout ~/msr/certs/ca.key \
+            -out ~/msr/certs/ca.crt \
+            -subj '/CN=${reg_host}-ca'
+
+        # 2. Generate server key + CSR
+        openssl req -nodes -newkey rsa:4096 \
             -keyout ~/msr/certs/server.key \
+            -out ~/msr/certs/server.csr \
+            -subj '/CN=${reg_host}'
+
+        # 3. Sign the CSR with the CA to produce the server cert (CA:FALSE, with SANs)
+        openssl x509 -req -days 3650 \
+            -in ~/msr/certs/server.csr \
+            -CA ~/msr/certs/ca.crt \
+            -CAkey ~/msr/certs/ca.key \
+            -CAcreateserial \
             -out ~/msr/certs/server.crt \
-            -subj '/CN=${reg_host}' \
-            -addext 'subjectAltName=DNS:${reg_host},IP:${bastion_private_ip}'
+            -extfile <(printf 'subjectAltName=DNS:%s,IP:%s\nbasicConstraints=CA:FALSE\n' \
+                '${reg_host}' '${bastion_private_ip}')
 
         echo '>>> Configuring harbor.yml...'
         mkdir -p ~/msr/data
@@ -425,8 +442,8 @@ RESOLVEOF
         # Trust the self-signed cert before starting Harbor so Docker already trusts it
         echo '>>> Adding registry cert to Docker trust store...'
         sudo mkdir -p /etc/docker/certs.d/${reg_host} /etc/docker/certs.d/${bastion_private_ip}
-        sudo cp ~/msr/certs/server.crt /etc/docker/certs.d/${reg_host}/ca.crt
-        sudo cp ~/msr/certs/server.crt /etc/docker/certs.d/${bastion_private_ip}/ca.crt
+        sudo cp ~/msr/certs/ca.crt /etc/docker/certs.d/${reg_host}/ca.crt
+        sudo cp ~/msr/certs/ca.crt /etc/docker/certs.d/${bastion_private_ip}/ca.crt
 
         echo '>>> Installing Harbor...'
         sudo ./install.sh
@@ -471,7 +488,7 @@ RESOLVEOF
     # SCP cert back for embedding in mke4.yaml
     local cert_file="${TERRAFORM_DIR}/registry_ca.crt"
     scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" \
-        "ubuntu@${bastion_ip}:~/msr/certs/server.crt" "${cert_file}"
+        "ubuntu@${bastion_ip}:~/msr/certs/ca.crt" "${cert_file}"
     success "Registry CA cert saved to $(basename "${cert_file}")"
 
     success "MSR4 registry setup complete on bastion."
@@ -1110,12 +1127,8 @@ mkectl_apply_on_bastion() {
     local debug_flag=""
     [[ "${debug:-false}" == "true" ]] && debug_flag="-l debug"
 
-    # v4.1.3 airgap: skip TLS verify for registry (workaround for self-signed cert issue)
-    local tls_skip_flag=""
-    [[ "${mke4k_version}" == "v4.1.3" ]] && tls_skip_flag="--registry-insecure-skip-tls-verify"
-
     info "Running mkectl apply on bastion (airgap mode)..."
-    ssh_node "${ssh_key}" "${bastion_ip}" "mkectl ${debug_flag} apply -f ~/mke4.yaml ${tls_skip_flag}"
+    ssh_node "${ssh_key}" "${bastion_ip}" "mkectl ${debug_flag} apply -f ~/mke4.yaml"
 
     # SCP kubeconfig back
     info "Retrieving kubeconfig from bastion..."
@@ -1571,8 +1584,12 @@ generate_mke4_yaml() {
             .spec.registries.chartRegistry.url = \"oci://${reg_host}/mke\"
         " "${mke4_yaml}"
 
-        yq e -i '.spec.registries.imageRegistry.caData = strenv(CERT_DATA)' "${mke4_yaml}"
-        yq e -i '.spec.registries.chartRegistry.caData = strenv(CERT_DATA)' "${mke4_yaml}"
+        yq e -i '
+            .spec.registries.imageRegistry.caData = strenv(CERT_DATA) |
+            .spec.registries.imageRegistry.caData style = "literal" |
+            .spec.registries.chartRegistry.caData = strenv(CERT_DATA) |
+            .spec.registries.chartRegistry.caData style = "literal"
+        ' "${mke4_yaml}"
         unset CERT_DATA
 
         info "Airgap mode: registry=${reg_host}, caData embedded"
@@ -1884,9 +1901,6 @@ prompt_upgrade_prep_airgap() {
             echo "      --chart-registry-ca-file=${ca_path} \\"
             echo "      --mke3-airgapped=true \\"
             echo "      --config ~/mke4.yaml \\"
-            if [[ "${target}" == "v4.1.3" ]]; then
-                echo "      --registry-insecure-skip-tls-verify \\"
-            fi
             echo "      --force${debug_flag:+ \\}"
             [[ -n "${debug_flag}" ]] && echo "      ${debug_flag}"
             echo ""
@@ -1943,19 +1957,12 @@ prompt_mke4k_upgrade_prep_airgap() {
             local debug_flag=""
             [[ "${debug:-false}" == "true" ]] && debug_flag="-l debug"
 
-            # v4.1.3: add --registry-insecure-skip-tls-verify (self-signed cert workaround)
-            local tls_skip_flag=""
-            [[ "${target}" == "v4.1.3" ]] && tls_skip_flag="--registry-insecure-skip-tls-verify"
-
             echo ""
             echo -e "  ${BOLD}To upgrade MKE4k, SSH to bastion and run:${RESET}"
             echo ""
             echo -e "    ${CYAN}mkectl upgrade${RESET} \\"
             echo "      --upgrade-version ${target} \\"
-            echo "      --release-matrix ~/release-matrix.json${tls_skip_flag:+ \\}"
-            if [[ -n "${tls_skip_flag}" ]]; then
-                echo "      ${tls_skip_flag}${debug_flag:+ \\}"
-            fi
+            echo "      --release-matrix ~/release-matrix.json${debug_flag:+ \\}"
             [[ -n "${debug_flag}" ]] && echo "      ${debug_flag}"
             echo ""
 
