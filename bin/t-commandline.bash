@@ -623,7 +623,15 @@ setup_node_proxy() {
     local proxy_url="http://${bastion_private_ip}:3128"
 
     # Build no_proxy list with all node IPs (curl doesn't support CIDR notation)
+    # Also include the NLB DNS name so mkectl upgrade connectivity checks (e.g.
+    # curl https://<nlb>:9443) bypass Squid — Squid only allows port 443 and
+    # the NLB is internal (private subnet), so it should never go via the proxy.
+    local lb_dns mke3_lb_dns
+    lb_dns="$(echo "${output}" | jq -r '.lb_dns_name.value // ""')"
+    mke3_lb_dns="$(echo "${output}" | jq -r '.mke3_lb_dns_name.value // ""')"
     local no_proxy_list="localhost,127.0.0.1,${bastion_private_ip},${reg_host}"
+    [[ -n "${lb_dns}" ]] && no_proxy_list="${no_proxy_list},${lb_dns}"
+    [[ -n "${mke3_lb_dns}" ]] && no_proxy_list="${no_proxy_list},${mke3_lb_dns}"
     for ip in "${all_ips[@]}"; do
         no_proxy_list="${no_proxy_list},${ip}"
     done
