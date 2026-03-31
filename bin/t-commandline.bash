@@ -2380,10 +2380,10 @@ print_airgap_deploy_summary() {
 
     echo ""
     echo -e "  ${BOLD}NLB:${RESET}       https://${lb_dns}"
+    echo -e "  ${BOLD}Registry:${RESET}  https://${bastion_pub_ip}  (Harbor, publicly accessible)"
     echo -e "  ${BOLD}SSH:${RESET}       t connect bastion      (direct)"
     echo -e "             t connect m1           (via bastion ProxyJump)"
     echo -e "  ${BOLD}Tunnels:${RESET}   t tunnel dashboard     → https://localhost:3000"
-    echo -e "             t tunnel registry      → https://localhost:8443"
     echo -e "             t tunnel               (show all + manual commands)"
     echo ""
 }
@@ -2475,10 +2475,10 @@ print_mke3_airgap_deploy_summary() {
     printf "╚%s╝\n" "${SEP}"
 
     echo ""
+    echo -e "  ${BOLD}Registry:${RESET}  https://${bastion_pub_ip}  (Harbor, publicly accessible)"
     echo -e "  ${BOLD}SSH:${RESET}       t connect bastion      (direct)"
     echo -e "             t connect m1           (via bastion ProxyJump)"
     echo -e "  ${BOLD}Tunnels:${RESET}   t tunnel mke3          → https://localhost:3000"
-    echo -e "             t tunnel registry      → https://localhost:8443"
     echo -e "             t tunnel               (show all + manual commands)"
     echo -e "  ${BOLD}Bundle:${RESET}    t gen client-bundle    (downloads certs + sets KUBECONFIG)"
     echo ""
@@ -2899,11 +2899,8 @@ cmd_tunnel() {
                 -L "0.0.0.0:3000:${mke3_lb_dns}:443" -N "ubuntu@${bastion_pub_ip}"
             ;;
         registry)
-            info "Tunnelling Harbor Registry UI → https://localhost:8443"
-            info "  (via bastion ${bastion_pub_ip} → localhost:443)"
-            info "  Press Ctrl-C to stop."
-            ssh -o StrictHostKeyChecking=no -i "${ssh_key}" \
-                -L "0.0.0.0:8443:localhost:443" -N "ubuntu@${bastion_pub_ip}"
+            info "Harbor Registry is publicly accessible — no tunnel needed."
+            info "  Open: https://${bastion_pub_ip}"
             ;;
         "")
             echo ""
@@ -2911,9 +2908,11 @@ cmd_tunnel() {
             echo ""
             echo "  t tunnel dashboard    MKE4k Dashboard → https://localhost:3000"
             echo "  t tunnel mke3         MKE3 Dashboard  → https://localhost:3000"
-            echo "  t tunnel registry     Harbor Registry  → https://localhost:8443"
             echo ""
-            echo -e "${BOLD}Or run manually:${RESET}"
+            echo -e "${BOLD}Harbor Registry (no tunnel needed — publicly accessible):${RESET}"
+            echo "  https://${bastion_pub_ip}"
+            echo ""
+            echo -e "${BOLD}Or run tunnels manually:${RESET}"
             echo ""
             echo "  # MKE4k Dashboard (via NLB)"
             echo "  ssh -i ${ssh_key} -L 0.0.0.0:3000:${lb_dns}:443 -N ubuntu@${bastion_pub_ip}"
@@ -2923,18 +2922,15 @@ cmd_tunnel() {
                 echo "  ssh -i ${ssh_key} -L 0.0.0.0:3000:${mke3_lb_dns}:443 -N ubuntu@${bastion_pub_ip}"
                 echo ""
             fi
-            echo "  # Harbor Registry UI"
-            echo "  ssh -i ${ssh_key} -L 0.0.0.0:8443:localhost:443 -N ubuntu@${bastion_pub_ip}"
-            echo ""
             echo "  # Kubernetes API (for local kubectl)"
             echo "  ssh -i ${ssh_key} -L 0.0.0.0:6443:${lb_dns}:6443 -N ubuntu@${bastion_pub_ip}"
             echo ""
             if [[ -t 0 ]]; then
-                echo -e "${CYAN}Note: If running inside Docker, start with -p 3000:3000 -p 8443:8443${RESET}"
+                echo -e "${CYAN}Note: If running inside Docker, start with -p 3000:3000${RESET}"
             fi
             ;;
         *)
-            die "Unknown tunnel target: ${target}. Try: dashboard, mke3, registry"
+            die "Unknown tunnel target: ${target}. Try: dashboard, mke3"
             ;;
     esac
 }
@@ -3046,7 +3042,6 @@ usage() {
     echo "  tunnel                      Show available SSH tunnels for airgap UIs"
     echo "  tunnel dashboard            MKE4k Dashboard → https://localhost:3000"
     echo "  tunnel mke3                 MKE3 Dashboard  → https://localhost:3000"
-    echo "  tunnel registry             Harbor Registry  → https://localhost:8443"
     echo ""
     echo "Prerequisites:"
     echo "  - AWS credentials exported (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)"
