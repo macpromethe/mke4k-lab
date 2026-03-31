@@ -1908,7 +1908,6 @@ prompt_upgrade_prep_airgap() {
             echo "      --image-registry-ca-file=${ca_path} \\"
             echo "      --chart-registry-ca-file=${ca_path} \\"
             echo "      --mke3-airgapped=true \\"
-            echo "      --config ~/mke4.yaml \\"
             echo "      --force${debug_flag:+ \\}"
             [[ -n "${debug_flag}" ]] && echo "      ${debug_flag}"
             echo ""
