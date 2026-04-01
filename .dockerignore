@@ -21,4 +21,3 @@ mke3/
 Dockerfile
 CLAUDE.md
 README.md
-bin/cleanup-aws.sh
