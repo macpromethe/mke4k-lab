@@ -125,6 +125,28 @@ load_config() {
     msr4_storage_size="${msr4_storage_size:-10Gi}"
 }
 
+msr4_credentials_file() {
+    printf '%s\n' "${TERRAFORM_DIR}/msr4_credentials.txt"
+}
+
+ensure_msr4_admin_credentials() {
+    local creds_file admin_pass
+    creds_file="$(msr4_credentials_file)"
+
+    if [[ -f "${creds_file}" ]]; then
+        admin_pass="$(grep '^password=' "${creds_file}" | cut -d= -f2)"
+        [[ -n "${admin_pass}" ]] || die "MSR4 credentials file is malformed: ${creds_file}"
+        info "Reusing MSR4 admin credentials from $(basename "${creds_file}")" >&2
+    else
+        admin_pass="$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 20)"
+        printf 'username=admin\npassword=%s\n' "${admin_pass}" > "${creds_file}"
+        chmod 600 "${creds_file}"
+        info "Generated MSR4 admin credentials -> $(basename "${creds_file}")" >&2
+    fi
+
+    printf '%s\n' "${admin_pass}"
+}
+
 write_tfvars() {
     local mke3_enabled="${1:-false}"
     local airgap_enabled="${2:-false}"
@@ -3412,6 +3434,8 @@ deploy_msr4_ha_backends() {
 #   image_registry: "registry.mirantis.com" (online) or "<reg_host>" (airgap)
 deploy_msr4_service() {
     local mode="$1" fqdn="$2" image_registry="$3"
+    local admin_pass
+    admin_pass="$(ensure_msr4_admin_credentials)"
 
     info "Deploying MSR4 (Harbor) service (${mode})..."
 
@@ -3438,6 +3462,7 @@ expose:
         port: 443
         nodePort: 33443
 externalURL: https://${fqdn}:33443
+harborAdminPassword: "${admin_pass}"
 persistence:
   persistentVolumeClaim:
     registry:
@@ -3663,6 +3688,11 @@ print_msr4_summary() {
     local output
     output="$(tf_output 2>/dev/null)" || return
 
+    local creds_file admin_pass
+    creds_file="$(msr4_credentials_file)"
+    admin_pass="$(grep '^password=' "${creds_file}" 2>/dev/null | cut -d= -f2 || true)"
+    [[ -n "${admin_pass}" ]] || admin_pass="(see $(basename "${creds_file}"))"
+
     local W=80
     local SEP; SEP="$(printf '═%.0s' $(seq 1 ${W}))"
     bline() {
@@ -3713,7 +3743,8 @@ print_msr4_summary() {
     sep
     bline "  Credentials"
     bline "    user: admin"
-    bline "    pass: Harbor12345"
+    bline "    pass: ${admin_pass}"
+    bline "    file: $(basename "${creds_file}")"
     printf "╚%s╝\n" "${SEP}"
     echo ""
 }

@@ -166,7 +166,7 @@ Exposed as `NodePort 33443` (HTTPS) on every cluster node. Two-tier TLS PKI; ser
 **Access:**
 - Online: `https://msr.<cluster>.local:33443` (add `/etc/hosts: <node-public-ip> msr.<cluster>.local`) or `https://<node-public-dns>:33443`
 - Airgap: `t tunnel msr4` -> `https://localhost:8444` (requires `/etc/hosts: 127.0.0.1 msr.<cluster>.local` if you want to use the FQDN URL)
-- Default credentials: `admin` / `Harbor12345`
+- Admin credentials: generated on first deploy, saved to `terraform/msr4_credentials.txt`
 
 ### Tunnels (airgap)
 

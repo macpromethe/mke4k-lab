@@ -13,7 +13,7 @@ cluster_name="mke4k-lab"
 # For HA control plane use 3 controllers (must be an odd number).
 # Workers run your workloads.
 controller_count=1
-worker_count=3
+worker_count=1
 
 # -- Instance sizing -----------------------------------------
 # All nodes use the same EC2 instance type.
@@ -37,7 +37,7 @@ ccm_enabled=false
 
 # -- Debug mode ----------------------------------------------
 # true -> mkectl runs with -l debug (very verbose output).
-debug=true
+debug=false
 
 # ============================================================
 #  MKE4k settings  (t deploy lab / t deploy lab mke4)
@@ -113,7 +113,7 @@ nfs_export_path="/srv/nfs/data"
 #          Run 't deploy msr4' (or 't deploy msr4 airgap') after the cluster
 #          and NFS StorageClass are up. Does NOT auto-run during 't deploy lab'.
 # false -> MSR4 commands refuse to run (default).
-msr4_enabled=true
+msr4_enabled=false
 
 # Harbor chart version deployed on the cluster.
 # NOTE: airgap_msr_version controls the *bastion* registry (separate).
@@ -122,7 +122,7 @@ msr4_version="4.13.3"
 # Replicas for the Harbor Service.
 #   1    -> simple mode: built-in DB + Redis (single pod each)
 #   2+   -> HA mode: external postgres-operator + redis-operator (requires NFS StorageClass)
-msr4_replicas=3
+msr4_replicas=1
 
 # Component versions used in HA mode (msr4_replicas >= 2).
 msr4_postgres_version="1.15.1"
