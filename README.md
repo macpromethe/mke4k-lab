@@ -19,10 +19,11 @@ docker run -it --name mke4k-lab \
   mke4k-lab
 
 # For airgap deployments, add port mappings for UI tunnels
+#   3000 = MKE4k/MKE3 Dashboard, 8443 = Harbor registry UI, 8444 = MSR4 (Harbor) UI
 docker run -it --name mke4k-lab \
   -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
   -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
-  -p 3000:3000 -p 8443:8443 \
+  -p 3000:3000 -p 8443:8443 -p 8444:8444 \
   mke4k-lab
 ```
 
@@ -146,6 +147,27 @@ Creates a dedicated NFS server EC2 instance, installs `nfs-common` on all cluste
 
 **Airgap support:** `.deb` packages are downloaded on the bastion and transferred via SCP. The provisioner image (`registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2`) is uploaded to a Harbor `nfs` project and the Helm chart is pulled on the bastion for offline install.
 
+### MSR4 (Harbor) on cluster
+
+| Command | Description |
+|---|---|
+| `t deploy msr4` | Deploy MSR4 (Harbor) on existing MKE4k cluster (online) |
+| `t deploy msr4 airgap` | Deploy MSR4 via bastion Harbor registry (airgap) |
+
+Set `msr4_enabled=true` in `config` to enable. Requires `nfs_enabled=true` for the PVC StorageClass; for HA (`msr4_replicas>=2`) you also need `worker_count >= msr4_replicas` — MKE4k taints controllers, so postgres/redis/harbor replicas only schedule on workers. `t deploy msr4` enforces this with a preflight die.
+
+- **Simple mode** (`msr4_replicas=1`): single Harbor pod with built-in PostgreSQL + Redis.
+- **HA mode** (`msr4_replicas>=2`): Zalando postgres-operator + OT-Container-Kit redis-operator installed as k0rdent `ServiceTemplate`s (Flux `HelmRepository` + k0rdent `ServiceTemplate`, namespace `k0rdent`). Harbor wired to external DB + Redis.
+
+Exposed as `NodePort 33443` (HTTPS) on every cluster node. Two-tier TLS PKI; server cert SANs include `msr.<cluster>.local`, all node IPs, and all node EC2 DNS names, so `https://<any-node>:33443` validates without `-k`.
+
+**Airgap support:** on `t deploy msr4 airgap`, the bastion pulls upstream images (skopeo) and charts (`helm pull`), then pushes them to Harbor under projects `postgres`, `redis`, `harbor`. The registry CA is added to the bastion's system trust so `helm push` over self-signed TLS works.
+
+**Access:**
+- Online: `https://msr.<cluster>.local:33443` (add `/etc/hosts: <node-public-ip> msr.<cluster>.local`) or `https://<node-public-dns>:33443`
+- Airgap: `t tunnel msr4` -> `https://localhost:8444` (requires `/etc/hosts: 127.0.0.1 msr.<cluster>.local` if you want to use the FQDN URL)
+- Default credentials: `admin` / `Harbor12345`
+
 ### Tunnels (airgap)
 
 | Command | Description |
@@ -154,6 +176,7 @@ Creates a dedicated NFS server EC2 instance, installs `nfs-common` on all cluste
 | `t tunnel dashboard` | MKE4k Dashboard tunnel -> https://localhost:3000 |
 | `t tunnel mke3` | MKE3 Dashboard tunnel -> https://localhost:3000 |
 | `t tunnel registry` | Harbor Registry tunnel -> https://localhost:8443 |
+| `t tunnel msr4` | MSR4 Harbor UI tunnel -> https://localhost:8444 |
 
 ### General
 
@@ -253,6 +276,10 @@ t tunnel mke3
 t tunnel registry
 # then browse https://localhost:8443
 
+# Airgap: access MSR4 (Harbor) UI (requires -p 8444:8444 on docker run)
+t tunnel msr4
+# then browse https://localhost:8444
+
 # Teardown
 t destroy lab
 ```
@@ -306,6 +333,18 @@ t destroy lab
 | `nfs_flavor` | `t3.small` | EC2 instance type for the NFS server |
 | `nfs_disk_gb` | `50` | Root volume size (GB) for the NFS server |
 | `nfs_export_path` | `/srv/nfs/data` | NFS export path on the server |
+
+### MSR4 settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `msr4_enabled` | `false` | Enables `t deploy msr4` / `t deploy msr4 airgap` (standalone; not auto-run during `t deploy lab`) |
+| `msr4_version` | `4.13.3` | Harbor chart version deployed on the cluster (separate from `airgap_msr_version` which controls the bastion registry) |
+| `msr4_replicas` | `1` | `1` = simple (built-in DB+Redis); `>=2` = HA (postgres-operator + redis-operator). HA requires `worker_count >= msr4_replicas` |
+| `msr4_postgres_version` | `1.15.1` | Zalando postgres-operator chart version (HA only) |
+| `msr4_redis_operator_version` | `0.24.0` | OT-Container-Kit redis-operator chart version (HA only) |
+| `msr4_redis_replication_version` | `0.16.13` | OT-Container-Kit redis-replication chart version (HA only) |
+| `msr4_storage_size` | `10Gi` | PVC size for the MSR4 registry volume (requires `nfs_enabled=true`) |
 
 ## Airgap Architecture
 

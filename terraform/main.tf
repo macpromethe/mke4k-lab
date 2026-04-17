@@ -120,6 +120,15 @@ resource "aws_security_group" "cluster_allow_ssh" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # MSR4 NodePort
+  ingress {
+    description = "MSR4 NodePort"
+    from_port   = 33443
+    to_port     = 33443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   # HTTP ingress
   ingress {
     description = "HTTP"
