@@ -11,6 +11,13 @@ terraform/registry_credentials.txt
 terraform/registry_ca.crt
 terraform/launchpad.yaml
 terraform/nodes.yaml
+terraform/msr4_ca.crt
+terraform/msr4_ca.key
+terraform/msr4_ca.srl
+terraform/msr4_tls.crt
+terraform/msr4_tls.key
+terraform/msr4_tls.csr
+terraform/msr4_redis_password.txt
 mke3/
 .DS_Store
 .git

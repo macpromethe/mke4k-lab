@@ -114,6 +114,37 @@ load_config() {
     nfs_flavor="${nfs_flavor:-t3.small}"
     nfs_disk_gb="${nfs_disk_gb:-50}"
     nfs_export_path="${nfs_export_path:-/srv/nfs/data}"
+
+    # MSR4 defaults
+    msr4_enabled="${msr4_enabled:-false}"
+    msr4_version="${msr4_version:-4.13.3}"
+    msr4_replicas="${msr4_replicas:-1}"
+    msr4_postgres_version="${msr4_postgres_version:-1.15.1}"
+    msr4_redis_operator_version="${msr4_redis_operator_version:-0.24.0}"
+    msr4_redis_replication_version="${msr4_redis_replication_version:-0.16.13}"
+    msr4_storage_size="${msr4_storage_size:-10Gi}"
+}
+
+msr4_credentials_file() {
+    printf '%s\n' "${TERRAFORM_DIR}/msr4_credentials.txt"
+}
+
+ensure_msr4_admin_credentials() {
+    local creds_file admin_pass
+    creds_file="$(msr4_credentials_file)"
+
+    if [[ -f "${creds_file}" ]]; then
+        admin_pass="$(grep '^password=' "${creds_file}" | cut -d= -f2)"
+        [[ -n "${admin_pass}" ]] || die "MSR4 credentials file is malformed: ${creds_file}"
+        info "Reusing MSR4 admin credentials from $(basename "${creds_file}")" >&2
+    else
+        admin_pass="$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 20)"
+        printf 'username=admin\npassword=%s\n' "${admin_pass}" > "${creds_file}"
+        chmod 600 "${creds_file}"
+        info "Generated MSR4 admin credentials -> $(basename "${creds_file}")" >&2
+    fi
+
+    printf '%s\n' "${admin_pass}"
 }
 
 write_tfvars() {
@@ -1818,11 +1849,11 @@ generate_nodes_yaml() {
 prompt_mkectl_for_upgrade() {
     echo ""
     local answer
-    read -r -p "$(echo -e "  ${BOLD}Download mkectl now to prepare for MKE3 → MKE4k upgrade?${RESET} [y/N] ")" answer
+    read -r -p "$(echo -e "  ${BOLD}Download mkectl now to prepare for MKE3 → MKE4k upgrade?${RESET} [y/N] ")" answer < /dev/tty
     case "${answer}" in
         [yY]|[yY][eE][sS])
             local ver_input
-            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input
+            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input < /dev/tty
             local target="${ver_input:-${mke4k_version}}"
             # Temporarily set mke4k_version so ensure_mkectl uses the chosen value
             local saved="${mke4k_version}"
@@ -1843,11 +1874,11 @@ prompt_mkectl_for_upgrade() {
 prompt_upgrade_prep_airgap() {
     echo ""
     local answer
-    read -r -p "$(echo -e "  ${BOLD}Prepare for MKE3 → MKE4k upgrade? (upload bundle + generate config)${RESET} [y/N] ")" answer
+    read -r -p "$(echo -e "  ${BOLD}Prepare for MKE3 → MKE4k upgrade? (upload bundle + generate config)${RESET} [y/N] ")" answer < /dev/tty
     case "${answer}" in
         [yY]|[yY][eE][sS])
             local ver_input
-            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input
+            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input < /dev/tty
             local target="${ver_input:-${mke4k_version}}"
             local saved="${mke4k_version}"
             mke4k_version="${target}"
@@ -1927,11 +1958,11 @@ prompt_upgrade_prep_airgap() {
 prompt_mke4k_upgrade_prep_airgap() {
     echo ""
     local answer
-    read -r -p "$(echo -e "  ${BOLD}Prepare for MKE4k → MKE4k airgap upgrade? (upload bundle + release-matrix)${RESET} [y/N] ")" answer
+    read -r -p "$(echo -e "  ${BOLD}Prepare for MKE4k → MKE4k airgap upgrade? (upload bundle + release-matrix)${RESET} [y/N] ")" answer < /dev/tty
     case "${answer}" in
         [yY]|[yY][eE][sS])
             local ver_input
-            read -r -p "  Target MKE4k version [${mke4k_version}]: " ver_input
+            read -r -p "  Target MKE4k version [${mke4k_version}]: " ver_input < /dev/tty
             local target="${ver_input:-${mke4k_version}}"
             local saved="${mke4k_version}"
             mke4k_version="${target}"
@@ -2777,6 +2808,1052 @@ cmd_deploy_nfs() {
     success "NFS setup complete."
 }
 
+# ---------------------------------------------------------------------------
+# MSR4 (Harbor) deployment — k0rdent ServiceTemplate based
+# ---------------------------------------------------------------------------
+# Exposed as NodePort 33443 (inside MKE4k default nodePortRange 32768-35535).
+# TLS: two-tier PKI (CA + server cert); cert CN = msr.<cluster>.local.
+# Simple mode (replicas=1): Harbor's built-in DB + Redis.
+# HA mode    (replicas>=2): postgres-operator + redis-operator, 3 mkectl-apply rounds.
+# ---------------------------------------------------------------------------
+
+# Run kubectl/helm locally (online) or on bastion via ssh (airgap).
+# Usage: _msr_kexec <mode> <ssh_key> <bastion_ip> <shell command...>
+_msr_kexec() {
+    local mode="$1" ssh_key="$2" bastion_ip="$3"
+    shift 3
+    if [[ "${mode}" == "airgap" ]]; then
+        ssh_node "${ssh_key}" "${bastion_ip}" "export KUBECONFIG=~/.mke/mke.kubeconf; $*"
+    else
+        bash -c "$*"
+    fi
+}
+
+# Pulls the current cluster config into local ${TERRAFORM_DIR}/mke4.yaml,
+# stripping ANSI INF/WRN log lines emitted by mkectl < v4.1.3.
+# Usage: fetch_current_mke4_yaml <online|airgap>
+fetch_current_mke4_yaml() {
+    local mode="$1"
+    local mke4_yaml="${TERRAFORM_DIR}/mke4.yaml"
+    local output ssh_key bastion_ip
+
+    info "Fetching current cluster config (mkectl config get, ${mode})..."
+
+    if [[ "${mode}" == "airgap" ]]; then
+        output="$(tf_output)"
+        ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+        bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+        ssh_node "${ssh_key}" "${bastion_ip}" \
+            "export KUBECONFIG=~/.mke/mke.kubeconf; mkectl config get 2>/dev/null" \
+            | sed -n '/^apiVersion:/,$p' > "${mke4_yaml}"
+    else
+        mkectl config get 2>/dev/null | sed -n '/^apiVersion:/,$p' > "${mke4_yaml}"
+    fi
+
+    [[ -s "${mke4_yaml}" ]] || die "mkectl config get returned empty output. Is the cluster up?"
+    # Sanity check
+    grep -q '^apiVersion:' "${mke4_yaml}" || die "mke4.yaml missing apiVersion header — check mkectl output"
+    info "  Wrote ${mke4_yaml} ($(wc -l < "${mke4_yaml}") lines)"
+}
+
+# Generates two-tier PKI: CA + server cert with DNS + IP SANs.
+# Writes: ${TERRAFORM_DIR}/msr4_ca.crt, msr4_ca.key, msr4_tls.crt, msr4_tls.key
+# Regens if CN changed OR if the SAN set changed (supports scale-up).
+# Usage: generate_msr4_tls_cert <fqdn> <san_entry>...
+#   Each san_entry is pre-formatted: "DNS:name" or "IP:1.2.3.4".
+#   The fqdn is always added as DNS:<fqdn> if not already present.
+generate_msr4_tls_cert() {
+    local fqdn="$1"; shift
+    local -a san_inputs=("$@")
+    local d="${TERRAFORM_DIR}"
+
+    # Dedupe + sort SAN entries; ensure DNS:<fqdn> is present.
+    local -a san_parts=()
+    local entry
+    local has_fqdn="false"
+    while IFS= read -r entry; do
+        [[ -z "${entry}" ]] && continue
+        san_parts+=("${entry}")
+        [[ "${entry}" == "DNS:${fqdn}" ]] && has_fqdn="true"
+    done < <(printf '%s\n' "${san_inputs[@]}" | awk 'NF' | sort -u)
+    if [[ "${has_fqdn}" == "false" ]]; then
+        san_parts=("DNS:${fqdn}" "${san_parts[@]}")
+    fi
+    local san_want
+    san_want="$(IFS=,; echo "${san_parts[*]}")"
+
+    if [[ -f "${d}/msr4_tls.crt" && -f "${d}/msr4_tls.key" && -f "${d}/msr4_ca.crt" ]]; then
+        # Compare full SAN (DNS+IPs) normalised
+        local existing_san
+        existing_san="$(openssl x509 -in "${d}/msr4_tls.crt" -noout -ext subjectAltName 2>/dev/null \
+            | grep -Ev '^(X509v3|subjectAltName|$)' \
+            | tr -d ' ' \
+            | sed 's/Address://g')"
+        # openssl prints SANs as "DNS:foo, IP Address:1.2.3.4" — normalise "IP Address:" -> "IP:"
+        existing_san="${existing_san//IPAddress:/IP:}"
+        existing_san="${existing_san//IP Address:/IP:}"
+        # Sort parts for comparison
+        local existing_norm
+        existing_norm="$(echo "${existing_san}" | tr ',' '\n' | sort -u | paste -sd, -)"
+        local want_norm
+        want_norm="$(echo "${san_want}" | tr ',' '\n' | sort -u | paste -sd, -)"
+        if [[ "${existing_norm}" == "${want_norm}" ]]; then
+            info "MSR4 TLS certs already match SANs (${san_want}) — reusing"
+            return 0
+        fi
+        info "Existing MSR4 certs have different SANs — regenerating"
+        info "  want:   ${san_want}"
+        info "  existing: ${existing_san}"
+    fi
+
+    info "Generating MSR4 TLS certs (SANs: ${san_want})..."
+
+    # CA cert
+    openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
+        -keyout "${d}/msr4_ca.key" -out "${d}/msr4_ca.crt" \
+        -subj "/CN=${fqdn}-ca" 2>/dev/null
+
+    # Server CSR
+    openssl req -nodes -newkey rsa:4096 \
+        -keyout "${d}/msr4_tls.key" -out "${d}/msr4_tls.csr" \
+        -subj "/CN=${fqdn}" 2>/dev/null
+
+    # Sign server cert (CA:FALSE, DNS + IP SANs)
+    openssl x509 -req -days 3650 \
+        -in "${d}/msr4_tls.csr" \
+        -CA "${d}/msr4_ca.crt" -CAkey "${d}/msr4_ca.key" \
+        -CAcreateserial -out "${d}/msr4_tls.crt" \
+        -extfile <(printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\n' "${san_want}") \
+        2>/dev/null
+
+    rm -f "${d}/msr4_tls.csr"
+    success "MSR4 TLS certs written to ${d}/msr4_{ca,tls}.{crt,key}"
+}
+
+# Upsert .spec.services[] entry in local mke4.yaml by name. Values are a
+# multi-line yaml string forced to literal block style.
+# Usage: add_service_to_mke4_yaml <name> <template> <ns> <values_file>
+add_service_to_mke4_yaml() {
+    local name="$1" template="$2" ns="$3" values_file="$4"
+    local mke4_yaml="${TERRAFORM_DIR}/mke4.yaml"
+
+    [[ -f "${mke4_yaml}" ]] || die "mke4.yaml not found. Run fetch_current_mke4_yaml first."
+    [[ -f "${values_file}" ]] || die "Values file not found: ${values_file}"
+
+    export SVC_NAME="${name}"
+    export SVC_TEMPLATE="${template}"
+    export SVC_NS="${ns}"
+    export SVC_VALUES
+    SVC_VALUES="$(cat "${values_file}")"
+
+    # Robust upsert: ensure services is a sequence, filter OUT any entries
+    # matching the name (removes *all* duplicates in case the file accumulated
+    # them from prior runs), then append the fresh entry. `map(select(...))`
+    # is more reliable across yq versions than `del(... select(...))`.
+    yq e -i '.spec.services = (.spec.services // [])' "${mke4_yaml}"
+    yq e -i '.spec.services |= map(select(.name != strenv(SVC_NAME)))' "${mke4_yaml}"
+    yq e -i '.spec.services += [{
+        "name": strenv(SVC_NAME),
+        "template": strenv(SVC_TEMPLATE),
+        "namespace": strenv(SVC_NS),
+        "values": strenv(SVC_VALUES)
+    }]' "${mke4_yaml}"
+    yq e -i '(.spec.services[] | select(.name == strenv(SVC_NAME)) | .values) style = "literal"' "${mke4_yaml}"
+
+    unset SVC_NAME SVC_TEMPLATE SVC_NS SVC_VALUES
+    info "  service ${BOLD}${name}${RESET} -> template=${template} ns=${ns}"
+}
+
+# Creates (or no-ops) the 'msr' namespace via kubectl apply.
+# Usage: create_msr4_namespace <online|airgap>
+create_msr4_namespace() {
+    local mode="$1"
+    local output="" ssh_key="" bastion_ip=""
+    if [[ "${mode}" == "airgap" ]]; then
+        output="$(tf_output)"
+        ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+        bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    fi
+    _msr_kexec "${mode}" "${ssh_key}" "${bastion_ip}" \
+        "kubectl create namespace msr --dry-run=client -o yaml | kubectl apply -f -"
+}
+
+# Creates the msr-tls-cert k8s TLS secret (holds tls.crt, tls.key, ca.crt).
+# In airgap mode, SCPs the cert files to /tmp/msr4-bundle/ on bastion first.
+# Usage: create_msr4_tls_secret <online|airgap>
+create_msr4_tls_secret() {
+    local mode="$1"
+    local d="${TERRAFORM_DIR}"
+
+    if [[ "${mode}" == "airgap" ]]; then
+        local output ssh_key bastion_ip
+        output="$(tf_output)"
+        ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+        bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+
+        ssh_node "${ssh_key}" "${bastion_ip}" "mkdir -p /tmp/msr4-bundle && chmod 700 /tmp/msr4-bundle"
+        scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" \
+            "${d}/msr4_tls.crt" "${d}/msr4_tls.key" "${d}/msr4_ca.crt" \
+            "ubuntu@${bastion_ip}:/tmp/msr4-bundle/"
+
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+            export KUBECONFIG=~/.mke/mke.kubeconf
+            kubectl -n msr create secret generic msr-tls-cert \
+                --from-file=tls.crt=/tmp/msr4-bundle/msr4_tls.crt \
+                --from-file=tls.key=/tmp/msr4-bundle/msr4_tls.key \
+                --from-file=ca.crt=/tmp/msr4-bundle/msr4_ca.crt \
+                --dry-run=client -o yaml | kubectl apply -f -
+        "
+    else
+        kubectl -n msr create secret generic msr-tls-cert \
+            --from-file=tls.crt="${d}/msr4_tls.crt" \
+            --from-file=tls.key="${d}/msr4_tls.key" \
+            --from-file=ca.crt="${d}/msr4_ca.crt" \
+            --dry-run=client -o yaml | kubectl apply -f -
+    fi
+    info "  secret msr/msr-tls-cert applied"
+}
+
+# Wait for pods matching label selector in namespace to become Ready.
+# Usage: wait_for_pods <online|airgap> <ns> <selector> <desc> <timeout>
+wait_for_pods() {
+    local mode="$1" ns="$2" selector="$3" desc="$4" timeout="$5"
+    local output="" ssh_key="" bastion_ip=""
+    if [[ "${mode}" == "airgap" ]]; then
+        output="$(tf_output)"
+        ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+        bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    fi
+
+    # Convert timeout like "600s" / "15m" into integer seconds
+    local to_val="${timeout}"
+    local to_sec
+    case "${to_val}" in
+        *s) to_sec="${to_val%s}" ;;
+        *m) to_sec=$(( ${to_val%m} * 60 )) ;;
+        *h) to_sec=$(( ${to_val%h} * 3600 )) ;;
+        *)  to_sec="${to_val}" ;;
+    esac
+    local max_iter=$(( to_sec / 10 ))
+    [[ ${max_iter} -lt 6 ]] && max_iter=6  # minimum ~60s
+
+    info "Waiting for ${desc} (ns=${ns}, ${selector}, up to ${timeout})..."
+
+    # Single polling loop that exits immediately when ready_count == total_count.
+    # Prints per-iteration progress so SSH output stays live.
+    local poll_cmd="
+        for i in \$(seq 1 ${max_iter}); do
+            total=\$(kubectl -n '${ns}' get pod -l '${selector}' --no-headers 2>/dev/null | wc -l | tr -d ' ')
+            ready=\$(kubectl -n '${ns}' get pod -l '${selector}' \
+                -o jsonpath='{range .items[*]}{.status.conditions[?(@.type==\"Ready\")].status} {end}' 2>/dev/null \
+                | tr ' ' '\\n' | grep -c True || true)
+            if [[ \${total:-0} -gt 0 && \${ready:-0} -eq \${total:-0} ]]; then
+                echo \"  [\${i}/${max_iter}] ${desc}: \${ready}/\${total} Ready — done\"
+                exit 0
+            fi
+            echo \"  [\${i}/${max_iter}] ${desc}: \${ready:-0}/\${total:-0} Ready\"
+            sleep 10
+        done
+        echo \"  [timeout] ${desc}: \${ready:-0}/\${total:-0} Ready after ${timeout}\" >&2
+        exit 1
+    "
+    _msr_kexec "${mode}" "${ssh_key}" "${bastion_ip}" "${poll_cmd}" \
+        || die "Timed out waiting for ${desc}"
+    info "  ${desc} is Ready"
+}
+
+# Renders the k0rdent HelmRepository + ServiceTemplate manifests to a local
+# temp file, then applies them to the cluster.
+# Usage: apply_msr4_k8s_resources <online|airgap> <reg_url>
+#   reg_url: for online this is ignored (public URLs used); for airgap pass e.g. "registry.mke4k-lab.local"
+apply_msr4_k8s_resources() {
+    local mode="$1" reg_url="$2"
+    local manifest
+    manifest="$(mktemp "${TMPDIR:-/tmp}/msr4-k0rdent-XXXX.yaml")"
+
+    # HelmRepository URL + type (Flux source API)
+    # - OCI  : type=oci
+    # - HTTP : type omitted (default)
+    local pg_url pg_type redis_url redis_type msr_url msr_type
+    if [[ "${mode}" == "airgap" ]]; then
+        pg_url="oci://${reg_url}/postgres";          pg_type="oci"
+        redis_url="oci://${reg_url}/redis";          redis_type="oci"
+        msr_url="oci://${reg_url}/harbor";           msr_type="oci"
+    else
+        pg_url="https://opensource.zalando.com/postgres-operator/charts/postgres-operator"; pg_type=""
+        redis_url="https://ot-container-kit.github.io/helm-charts";                         redis_type=""
+        msr_url="oci://registry.mirantis.com/harbor/helm";                                  msr_type="oci"
+    fi
+
+    _emit_helm_repo() {
+        local name="$1" url="$2" type="$3"
+        cat <<EOF
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: ${name}
+  namespace: k0rdent
+  labels:
+    k0rdent.mirantis.com/managed: "true"
+spec:
+  interval: 10m0s
+  provider: generic
+  url: ${url}
+EOF
+        if [[ -n "${type}" ]]; then
+            echo "  type: ${type}"
+        fi
+        return 0
+    }
+
+    _emit_service_template() {
+        local name="$1" chart="$2" version="$3" repo_name="$4"
+        cat <<EOF
+---
+apiVersion: k0rdent.mirantis.com/v1beta1
+kind: ServiceTemplate
+metadata:
+  name: ${name}
+  namespace: k0rdent
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  helm:
+    chartSpec:
+      chart: ${chart}
+      version: ${version}
+      interval: 10m0s
+      sourceRef:
+        kind: HelmRepository
+        name: ${repo_name}
+EOF
+    }
+
+    {
+        if [[ "${msr4_replicas}" -ge 2 ]]; then
+            _emit_helm_repo "postgres-operator" "${pg_url}"   "${pg_type}"
+            _emit_helm_repo "redis-operator"    "${redis_url}" "${redis_type}"
+            _emit_service_template "postgres-operator-${msr4_postgres_version}" \
+                "postgres-operator" "${msr4_postgres_version}" "postgres-operator"
+            _emit_service_template "redis-operator-${msr4_redis_operator_version}" \
+                "redis-operator" "${msr4_redis_operator_version}" "redis-operator"
+            _emit_service_template "redis-replication-${msr4_redis_replication_version}" \
+                "redis-replication" "${msr4_redis_replication_version}" "redis-operator"
+        fi
+        _emit_helm_repo "msr" "${msr_url}" "${msr_type}"
+        _emit_service_template "msr-${msr4_version}" "msr" "${msr4_version}" "msr"
+    } > "${manifest}"
+
+    unset -f _emit_helm_repo _emit_service_template
+
+    info "Applying k0rdent HelmRepository + ServiceTemplate CRs..."
+    if [[ "${mode}" == "airgap" ]]; then
+        local output ssh_key bastion_ip
+        output="$(tf_output)"
+        ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+        bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+        scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" \
+            "${manifest}" "ubuntu@${bastion_ip}:/tmp/msr4-k0rdent.yaml"
+        ssh_node "${ssh_key}" "${bastion_ip}" \
+            "export KUBECONFIG=~/.mke/mke.kubeconf; kubectl apply -f /tmp/msr4-k0rdent.yaml"
+    else
+        kubectl apply -f "${manifest}"
+    fi
+    rm -f "${manifest}"
+    info "  k0rdent MSR4 resources applied"
+}
+
+# Run `mkectl apply -f mke4.yaml` — locally for online, on bastion for airgap.
+# Usage: msr4_mkectl_apply <online|airgap>
+msr4_mkectl_apply() {
+    local mode="$1"
+    local mke4_yaml="${TERRAFORM_DIR}/mke4.yaml"
+    [[ -f "${mke4_yaml}" ]] || die "mke4.yaml not found — fetch_current_mke4_yaml first"
+
+    local debug_flag=""
+    [[ "${debug:-false}" == "true" ]] && debug_flag="-l debug"
+
+    if [[ "${mode}" == "airgap" ]]; then
+        mkectl_apply_on_bastion
+    else
+        info "Running mkectl apply (online)..."
+        mkectl ${debug_flag} apply -f "${mke4_yaml}"
+    fi
+}
+
+# HA (msr4_replicas >= 2) requires at least msr4_replicas workers because
+# MKE4k taints controllers (node-role.kubernetes.io/master), so postgres-operator
+# (pod anti-affinity), redis-replication (clusterSize), and Harbor (replicas per
+# component) can only be scheduled on worker nodes. Fail fast with a clear
+# message instead of letting pods sit pending.
+msr4_preflight_ha_nodes() {
+    if [[ "${msr4_replicas:-1}" -ge 2 ]]; then
+        local need="${msr4_replicas}"
+        if [[ "${worker_count:-0}" -lt "${need}" ]]; then
+            die "HA mode requires worker_count >= msr4_replicas (${need}). Current: worker_count=${worker_count:-0}.
+  Controllers are tainted node-role.kubernetes.io/master and cannot host postgres/redis/harbor replicas.
+  Fix: set worker_count=${need} (and optionally controller_count=3 for HA control plane) in 'config', then rerun 't deploy lab'."
+        fi
+    fi
+}
+
+# Renders postgres-operator helm values and adds the service entry to mke4.yaml.
+# Does NOT apply mkectl or wait — caller runs the batched apply in
+# deploy_msr4_ha_backends().
+# Usage: prepare_msr4_postgres_service <online|airgap> <image_registry>
+prepare_msr4_postgres_service() {
+    local mode="$1" image_registry="$2"
+
+    # Image split: online uses upstream repos, airgap uses Harbor
+    local pg_img_registry pg_img_repo spilo_image
+    if [[ "${mode}" == "airgap" ]]; then
+        pg_img_registry="${image_registry}"
+        pg_img_repo="postgres/postgres-operator"
+        spilo_image="${image_registry}/postgres/spilo:17-4.0-p3"
+    else
+        pg_img_registry="ghcr.io"
+        pg_img_repo="zalando/postgres-operator"
+        spilo_image="registry.mirantis.com/msr/spilo:17-4.0-p3-20251117010013"
+    fi
+
+    local values_file
+    values_file="$(mktemp "${TMPDIR:-/tmp}/msr4-postgres-values-XXXX.yaml")"
+    cat > "${values_file}" <<EOF
+image:
+  registry: "${pg_img_registry}"
+  repository: ${pg_img_repo}
+  tag: v${msr4_postgres_version}
+configGeneral:
+  docker_image: "${spilo_image}"
+configKubernetes:
+  spilo_privileged: false
+  spilo_allow_privilege_escalation: false
+  enable_pod_antiaffinity: true
+installNamespaces: true
+EOF
+
+    add_service_to_mke4_yaml "postgres-operator" \
+        "postgres-operator-${msr4_postgres_version}" "msr" "${values_file}"
+    rm -f "${values_file}"
+}
+
+# Creates msr-redis-secret (idempotent), renders redis-operator +
+# redis-replication helm values, adds them as services in mke4.yaml. No apply.
+# Usage: prepare_msr4_redis_services <online|airgap> <image_registry>
+prepare_msr4_redis_services() {
+    local mode="$1" image_registry="$2"
+    local output="" ssh_key="" bastion_ip=""
+    if [[ "${mode}" == "airgap" ]]; then
+        output="$(tf_output)"
+        ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+        bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    fi
+
+    # Generate + persist redis password
+    info "Ensuring msr-redis-secret..."
+    local pw_file="${TERRAFORM_DIR}/msr4_redis_password.txt"
+    [[ -f "${pw_file}" ]] || openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 32 > "${pw_file}"
+    local redis_pw
+    redis_pw="$(cat "${pw_file}")"
+
+    # Key must be REDIS_PASSWORD (uppercase) — Harbor chart's redis.pwdfromsecret
+    # template and redis-replication's secretKey both look up this exact key name.
+    if [[ "${mode}" == "airgap" ]]; then
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+            export KUBECONFIG=~/.mke/mke.kubeconf
+            if ! kubectl -n msr get secret msr-redis-secret &>/dev/null; then
+                kubectl -n msr create secret generic msr-redis-secret \
+                    --from-literal=REDIS_PASSWORD='${redis_pw}'
+            fi
+        "
+    else
+        if ! kubectl -n msr get secret msr-redis-secret &>/dev/null; then
+            kubectl -n msr create secret generic msr-redis-secret \
+                --from-literal=REDIS_PASSWORD="${redis_pw}"
+        fi
+    fi
+
+    # Image split
+    local redis_op_image redis_image
+    if [[ "${mode}" == "airgap" ]]; then
+        redis_op_image="${image_registry}/redis/redis-operator"
+        redis_image="${image_registry}/redis/redis"
+    else
+        redis_op_image="quay.io/opstree/redis-operator"
+        redis_image="quay.io/opstree/redis"
+    fi
+
+    local op_values rep_values
+    op_values="$(mktemp "${TMPDIR:-/tmp}/msr4-redis-op-values-XXXX.yaml")"
+    rep_values="$(mktemp "${TMPDIR:-/tmp}/msr4-redis-rep-values-XXXX.yaml")"
+
+    cat > "${op_values}" <<EOF
+redisOperator:
+  imageName: ${redis_op_image}
+  imageTag: v${msr4_redis_operator_version}
+  imagePullPolicy: IfNotPresent
+EOF
+
+    # NOTE: redisSecret and storageSpec MUST be nested under redisReplication
+    # (OT-Container-Kit chart contract). Top-level placement silently no-ops,
+    # leaving Redis with no password, and Harbor fails to AUTH.
+    cat > "${rep_values}" <<EOF
+redisReplication:
+  name: msr-redis
+  clusterSize: ${msr4_replicas}
+  image: ${redis_image}
+  tag: v8.2.2
+  imagePullPolicy: IfNotPresent
+  redisSecret:
+    secretName: msr-redis-secret
+    secretKey: REDIS_PASSWORD
+  storageSpec:
+    volumeClaimTemplate:
+      spec:
+        storageClassName: nfs-client
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+EOF
+
+    add_service_to_mke4_yaml "redis-operator" \
+        "redis-operator-${msr4_redis_operator_version}" "msr" "${op_values}"
+    add_service_to_mke4_yaml "redis-replication" \
+        "redis-replication-${msr4_redis_replication_version}" "msr" "${rep_values}"
+    rm -f "${op_values}" "${rep_values}"
+}
+
+# Applies the postgresql CR (acid.zalan.do/v1) and waits for
+# PostgresClusterStatus=Running. Assumes postgres-operator is already Ready.
+# Usage: apply_postgresql_cr <online|airgap>
+apply_postgresql_cr() {
+    local mode="$1"
+    local output="" ssh_key="" bastion_ip=""
+    if [[ "${mode}" == "airgap" ]]; then
+        output="$(tf_output)"
+        ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+        bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    fi
+
+    info "Creating postgresql CR (msr-postgres)..."
+    local pg_cr_file
+    pg_cr_file="$(mktemp "${TMPDIR:-/tmp}/msr4-postgresql-XXXX.yaml")"
+    cat > "${pg_cr_file}" <<EOF
+apiVersion: acid.zalan.do/v1
+kind: postgresql
+metadata:
+  name: msr-postgres
+  namespace: msr
+spec:
+  teamId: msr
+  numberOfInstances: ${msr4_replicas}
+  postgresql:
+    version: "17"
+  volume:
+    size: ${msr4_storage_size}
+    storageClass: nfs-client
+  users:
+    msr:
+      - superuser
+      - createdb
+  databases:
+    registry: msr
+  enableLogicalBackup: false
+  enableShmVolume: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+EOF
+
+    if [[ "${mode}" == "airgap" ]]; then
+        scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" \
+            "${pg_cr_file}" "ubuntu@${bastion_ip}:/tmp/msr4-postgresql.yaml"
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+            export KUBECONFIG=~/.mke/mke.kubeconf
+            kubectl apply -f /tmp/msr4-postgresql.yaml
+        "
+    else
+        kubectl apply -f "${pg_cr_file}"
+    fi
+    rm -f "${pg_cr_file}"
+
+    info "Waiting for PostgresClusterStatus=Running (up to 15 min)..."
+    local wait_cmd="
+        export KUBECONFIG=\${KUBECONFIG:-~/.mke/mke.kubeconf}
+        for _ in \$(seq 1 90); do
+            s=\$(kubectl -n msr get postgresql/msr-postgres -o jsonpath='{.status.PostgresClusterStatus}' 2>/dev/null)
+            if [[ \"\${s}\" == 'Running' ]]; then
+                echo 'postgres cluster is Running'
+                exit 0
+            fi
+            echo \"  [\${s:-pending}] waiting for postgres...\"
+            sleep 10
+        done
+        echo 'Timed out waiting for postgres cluster' >&2
+        exit 1
+    "
+    _msr_kexec "${mode}" "${ssh_key}" "${bastion_ip}" "${wait_cmd}" \
+        || die "postgresql/msr-postgres did not reach Running state"
+}
+
+# Option B orchestrator — ROUND 1 of the HA deploy:
+# 1. Prepare postgres-operator + redis-operator + redis-replication services
+# 2. Single mkectl apply (all three at once)
+# 3. Wait for postgres-operator pod
+# 4. Apply postgresql CR, wait for PostgresClusterStatus=Running
+# 5. Wait for redis-operator + redis-replication pods
+# Usage: deploy_msr4_ha_backends <online|airgap> <pg_image_registry> <redis_image_registry>
+deploy_msr4_ha_backends() {
+    local mode="$1" pg_registry="$2" redis_registry="$3"
+
+    info "HA Round 1 — preparing postgres + redis services..."
+    prepare_msr4_postgres_service "${mode}" "${pg_registry}"
+    prepare_msr4_redis_services   "${mode}" "${redis_registry}"
+
+    info "HA Round 1 — running mkectl apply (postgres + redis in one shot)..."
+    msr4_mkectl_apply "${mode}"
+
+    wait_for_pods "${mode}" "msr" "app.kubernetes.io/name=postgres-operator" \
+        "postgres-operator pod" "600s"
+    apply_postgresql_cr "${mode}"
+    wait_for_pods "${mode}" "msr" "name=redis-operator" "redis-operator pod" "600s"
+    wait_for_pods "${mode}" "msr" "app=msr-redis" "redis replication pods" "600s"
+
+    success "HA Round 1 complete — postgres + redis ready"
+}
+
+# Deploy MSR4 (Harbor) service. Always called (simple + HA).
+# Usage: deploy_msr4_service <online|airgap> <fqdn> <image_registry>
+#   image_registry: "registry.mirantis.com" (online) or "<reg_host>" (airgap)
+deploy_msr4_service() {
+    local mode="$1" fqdn="$2" image_registry="$3"
+    local admin_pass
+    admin_pass="$(ensure_msr4_admin_credentials)"
+
+    info "Deploying MSR4 (Harbor) service (${mode})..."
+
+    local values_file
+    values_file="$(mktemp "${TMPDIR:-/tmp}/msr4-harbor-values-XXXX.yaml")"
+
+    # Base (simple) values
+    {
+        cat <<EOF
+expose:
+  type: nodePort
+  tls:
+    enabled: true
+    certSource: secret
+    secret:
+      secretName: msr-tls-cert
+  nodePort:
+    name: harbor
+    ports:
+      http:
+        port: 80
+        nodePort: 33442
+      https:
+        port: 443
+        nodePort: 33443
+externalURL: https://${fqdn}:33443
+harborAdminPassword: "${admin_pass}"
+persistence:
+  persistentVolumeClaim:
+    registry:
+      storageClass: nfs-client
+      accessMode: ReadWriteMany
+      size: ${msr4_storage_size}
+    jobservice:
+      storageClass: nfs-client
+      accessMode: ReadWriteMany
+    database:
+      storageClass: nfs-client
+      accessMode: ReadWriteOnce
+    redis:
+      storageClass: nfs-client
+      accessMode: ReadWriteOnce
+    trivy:
+      storageClass: nfs-client
+      accessMode: ReadWriteOnce
+EOF
+
+        # Airgap: pin all chart images to bastion Harbor via global.registry.
+        # Per-component image.repository overrides were ineffective (the Mirantis
+        # MSR chart doesn't honor them consistently); global.registry is the
+        # canonical hook per the k0rdent MSR4 installation docs.
+        if [[ "${mode}" == "airgap" ]]; then
+            cat <<EOF
+global:
+  registry: ${image_registry}/harbor
+imagePullPolicy: IfNotPresent
+trivy:
+  enabled: false
+EOF
+        fi
+
+        # HA mode overlay
+        if [[ "${msr4_replicas}" -ge 2 ]]; then
+            cat <<EOF
+portal:
+  replicas: ${msr4_replicas}
+core:
+  replicas: ${msr4_replicas}
+jobservice:
+  replicas: ${msr4_replicas}
+registry:
+  replicas: ${msr4_replicas}
+database:
+  type: external
+  external:
+    sslmode: require
+    host: msr-postgres.msr.svc.cluster.local
+    port: "5432"
+    username: msr
+    coreDatabase: registry
+    existingSecret: msr.msr-postgres.credentials.postgresql.acid.zalan.do
+redis:
+  type: external
+  external:
+    addr: "msr-redis-master:6379"
+    existingSecret: msr-redis-secret
+EOF
+        fi
+    } > "${values_file}"
+
+    add_service_to_mke4_yaml "msr" "msr-${msr4_version}" "msr" "${values_file}"
+    rm -f "${values_file}"
+
+    msr4_mkectl_apply "${mode}"
+
+    wait_for_pods "${mode}" "msr" "component=core" "MSR4 core pod" "900s"
+    success "MSR4 (Harbor) deployed"
+}
+
+# Airgap — upload MSR4 images + helm charts to bastion Harbor.
+# Creates Harbor projects (postgres, redis, harbor), trusts CA in system store
+# (so helm push works over TLS), then:
+#   - skopeo-copies images in containerized docker (--add-host pattern).
+#   - helm-pulls charts, helm-pushes to Harbor OCI.
+# Always uploads Harbor chart+images. HA mode also uploads postgres+redis.
+upload_msr4_artifacts() {
+    load_config
+    local output ssh_key bastion_ip bastion_private_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    bastion_private_ip="$(echo "${output}" | jq -r '.bastion_private_ip.value')"
+
+    local creds_file="${TERRAFORM_DIR}/registry_credentials.txt"
+    [[ -f "${creds_file}" ]] || die "Registry credentials not found. Run 't deploy registry' first."
+    local registry_pass
+    registry_pass="$(grep '^password=' "${creds_file}" | cut -d= -f2)"
+
+    local reg_host="${registry_hostname}"
+    local ha=false
+    [[ "${msr4_replicas}" -ge 2 ]] && ha=true
+
+    info "Uploading MSR4 images + charts to ${reg_host} (HA=${ha})..."
+
+    ssh_node "${ssh_key}" "${bastion_ip}" "
+        set -euo pipefail
+
+        # --- Install CA into system trust store (one-time) so helm trusts Harbor TLS
+        if [[ ! -f /usr/local/share/ca-certificates/msr-registry-ca.crt ]]; then
+            sudo cp ~/msr/certs/ca.crt /usr/local/share/ca-certificates/msr-registry-ca.crt
+            sudo update-ca-certificates
+            echo 'Registry CA installed in system trust store'
+        fi
+
+        # --- Install helm if missing
+        if ! command -v helm &>/dev/null; then
+            echo '>>> Installing helm...'
+            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        fi
+
+        # --- Create Harbor projects: postgres, redis, harbor
+        for proj in postgres redis harbor; do
+            if ! curl -sk -u 'admin:${registry_pass}' \
+                    \"https://${reg_host}/api/v2.0/projects?name=\${proj}\" | grep -q \"\\\"name\\\":\\\"\${proj}\\\"\"; then
+                curl -sk -u 'admin:${registry_pass}' \
+                    -X POST \"https://${reg_host}/api/v2.0/projects\" \
+                    -H 'Content-Type: application/json' \
+                    -d \"{\\\"project_name\\\":\\\"\${proj}\\\",\\\"public\\\":true}\" || true
+                echo \"  Created Harbor project: \${proj}\"
+            fi
+        done
+
+        # --- helm registry login (for chart push)
+        echo '${registry_pass}' | helm registry login ${reg_host} -u admin --password-stdin >/dev/null
+    "
+
+    # --- Image uploads via skopeo container
+    info "Copying images via skopeo..."
+
+    # Build the list of images to copy. Format: src_image|dest_repo:dest_tag
+    local -a images=(
+        "registry.mirantis.com/harbor/harbor-core:v${msr4_version}|harbor/harbor-core:v${msr4_version}"
+        "registry.mirantis.com/harbor/harbor-db:v${msr4_version}|harbor/harbor-db:v${msr4_version}"
+        "registry.mirantis.com/harbor/harbor-jobservice:v${msr4_version}|harbor/harbor-jobservice:v${msr4_version}"
+        "registry.mirantis.com/harbor/harbor-portal:v${msr4_version}|harbor/harbor-portal:v${msr4_version}"
+        "registry.mirantis.com/harbor/harbor-registryctl:v${msr4_version}|harbor/harbor-registryctl:v${msr4_version}"
+        "registry.mirantis.com/harbor/nginx-photon:v${msr4_version}|harbor/nginx-photon:v${msr4_version}"
+        "registry.mirantis.com/harbor/redis-photon:v${msr4_version}|harbor/redis-photon:v${msr4_version}"
+        "registry.mirantis.com/harbor/registry-photon:v${msr4_version}|harbor/registry-photon:v${msr4_version}"
+    )
+    if [[ "${ha}" == "true" ]]; then
+        images+=(
+            "ghcr.io/zalando/postgres-operator:v${msr4_postgres_version}|postgres/postgres-operator:v${msr4_postgres_version}"
+            "registry.mirantis.com/msr/spilo:17-4.0-p3-20251117010013|postgres/spilo:17-4.0-p3"
+            "quay.io/opstree/redis-operator:v${msr4_redis_operator_version}|redis/redis-operator:v${msr4_redis_operator_version}"
+            "quay.io/opstree/redis:v8.2.2|redis/redis:v8.2.2"
+        )
+    fi
+
+    local pair src dest
+    for pair in "${images[@]}"; do
+        src="${pair%%|*}"
+        dest="${pair#*|}"
+        info "  copy ${src} -> ${reg_host}/${dest}"
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+            docker run --rm \
+                --add-host '${reg_host}:${bastion_private_ip}' \
+                -v /etc/docker/certs.d/${reg_host}/ca.crt:/etc/docker/certs.d/${reg_host}/ca.crt:ro \
+                quay.io/skopeo/stable:v1.18.0 copy \
+                    --dest-tls-verify=false \
+                    --dest-creds 'admin:${registry_pass}' \
+                    'docker://${src}' \
+                    'docker://${reg_host}/${dest}'
+        "
+    done
+
+    # --- Helm chart uploads on bastion
+    info "Pulling + pushing helm charts..."
+
+    ssh_node "${ssh_key}" "${bastion_ip}" "
+        set -euo pipefail
+        mkdir -p ~/msr4-charts
+        cd ~/msr4-charts
+
+        # Always: msr chart (from OCI). Chart name is 'msr', not 'harbor'.
+        if [[ ! -f msr-${msr4_version}.tgz ]]; then
+            echo '>>> Pulling msr-${msr4_version}.tgz from registry.mirantis.com...'
+            helm pull oci://registry.mirantis.com/harbor/helm/msr --version '${msr4_version}'
+        fi
+        echo '>>> Pushing msr chart to ${reg_host}/harbor'
+        helm push \"msr-${msr4_version}.tgz\" 'oci://${reg_host}/harbor'
+    "
+
+    if [[ "${ha}" == "true" ]]; then
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+            set -euo pipefail
+            cd ~/msr4-charts
+
+            # postgres-operator (HTTP repo)
+            helm repo add postgres-operator-charts https://opensource.zalando.com/postgres-operator/charts/postgres-operator 2>/dev/null || true
+            helm repo update postgres-operator-charts
+            if [[ ! -f postgres-operator-${msr4_postgres_version}.tgz ]]; then
+                helm pull postgres-operator-charts/postgres-operator --version '${msr4_postgres_version}'
+            fi
+            echo '>>> Pushing postgres-operator chart to ${reg_host}/postgres'
+            helm push \"postgres-operator-${msr4_postgres_version}.tgz\" 'oci://${reg_host}/postgres'
+
+            # redis-operator + redis-replication (HTTP repo)
+            helm repo add ot-helm https://ot-container-kit.github.io/helm-charts 2>/dev/null || true
+            helm repo update ot-helm
+            if [[ ! -f redis-operator-${msr4_redis_operator_version}.tgz ]]; then
+                helm pull ot-helm/redis-operator --version '${msr4_redis_operator_version}'
+            fi
+            if [[ ! -f redis-replication-${msr4_redis_replication_version}.tgz ]]; then
+                helm pull ot-helm/redis-replication --version '${msr4_redis_replication_version}'
+            fi
+            echo '>>> Pushing redis-operator + redis-replication charts to ${reg_host}/redis'
+            helm push \"redis-operator-${msr4_redis_operator_version}.tgz\" 'oci://${reg_host}/redis'
+            helm push \"redis-replication-${msr4_redis_replication_version}.tgz\" 'oci://${reg_host}/redis'
+        "
+    fi
+
+    success "MSR4 artifacts uploaded to ${reg_host}"
+}
+
+# Pretty-printed MSR4 deploy summary.
+# Usage: print_msr4_summary <online|airgap> <fqdn>
+print_msr4_summary() {
+    local mode="$1" fqdn="$2"
+    local output
+    output="$(tf_output 2>/dev/null)" || return
+
+    local creds_file admin_pass
+    creds_file="$(msr4_credentials_file)"
+    admin_pass="$(grep '^password=' "${creds_file}" 2>/dev/null | cut -d= -f2 || true)"
+    [[ -n "${admin_pass}" ]] || admin_pass="(see $(basename "${creds_file}"))"
+
+    local W=80
+    local SEP; SEP="$(printf '═%.0s' $(seq 1 ${W}))"
+    bline() {
+        # Truncate overlong lines rather than overrun the frame
+        local t="$1"
+        if [[ ${#t} -gt ${W} ]]; then
+            t="${t:0:$((W - 1))}…"
+        fi
+        printf "║%-${W}s║\n" "${t}"
+    }
+    cline() {
+        local t="$1" lp rp
+        lp=$(( (W - ${#t}) / 2 ))
+        rp=$(( W - ${#t} - lp ))
+        printf "║%*s%s%*s║\n" $lp "" "$t" $rp ""
+    }
+    sep() { printf "╠%s╣\n" "${SEP}"; }
+
+    local ha_str="Simple (replicas=1)"
+    [[ "${msr4_replicas}" -ge 2 ]] && ha_str="HA (replicas=${msr4_replicas})"
+
+    local ctrl_pub_dns=""
+    ctrl_pub_dns="$(echo "${output}" | jq -r '.controller_public_dns.value[0]? // empty' 2>/dev/null)"
+
+    echo ""
+    printf "╔%s╗\n" "${SEP}"
+    cline "MSR4 (Harbor) -- Deployment Complete"
+    sep
+    bline "$(printf '  %-14s %s' 'Version'   "${msr4_version}")"
+    bline "$(printf '  %-14s %s' 'Mode'      "${ha_str}")"
+    bline "$(printf '  %-14s %s' 'Namespace' "msr")"
+    bline "$(printf '  %-14s %s' 'TLS CN'    "${fqdn}")"
+    sep
+    bline "  Access"
+    if [[ "${mode}" == "airgap" ]]; then
+        bline "    SSH tunnel:  t tunnel msr4"
+        bline "    URL:         https://${fqdn}:8444"
+        bline "                 https://localhost:8444   (TLS validates via 127.0.0.1 SAN)"
+        bline "    /etc/hosts:  127.0.0.1  ${fqdn}"
+    else
+        bline "    URL:         https://${fqdn}:33443"
+        if [[ -n "${ctrl_pub_dns}" ]]; then
+            bline "                 https://${ctrl_pub_dns}:33443"
+        fi
+        bline "    /etc/hosts:  <node-public-ip>  ${fqdn}"
+        bline "    (cert SANs cover all node IPs + public DNS names)"
+    fi
+    sep
+    bline "  Credentials"
+    bline "    user: admin"
+    bline "    pass: ${admin_pass}"
+    bline "    file: $(basename "${creds_file}")"
+    printf "╚%s╝\n" "${SEP}"
+    echo ""
+}
+
+# Online MSR4 deploy: runs kubectl/helm locally against the public NLB.
+cmd_deploy_msr4() {
+    load_config
+    [[ "${msr4_enabled}" == "true" ]] || die "msr4_enabled is not true in config"
+    msr4_preflight_ha_nodes
+
+    ensure_mkectl
+
+    local kc="${KUBECONFIG}"
+    [[ -f "${kc}" ]] || die "kubeconfig not found at ${kc}. Deploy the cluster first."
+
+    local output
+    output="$(tf_output 2>/dev/null)" || die "Could not read terraform output. Has terraform been applied?"
+
+    local bastion_ip=""
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    [[ -z "${bastion_ip}" || "${bastion_ip}" == "null" ]] || \
+        die "This is an airgap cluster — use 't deploy msr4 airgap' instead."
+
+    info "Preflight: verify nfs-client StorageClass..."
+    kubectl get sc nfs-client >/dev/null 2>&1 \
+        || die "StorageClass 'nfs-client' not found. Set nfs_enabled=true and run 't deploy nfs' first."
+
+    local fqdn="msr.${cluster_name}.local"
+
+    # Cert SANs: public IPs + public EC2 DNS names of every node. Both
+    # https://<ip>:33443 AND https://ec2-...amazonaws.com:33443 validate.
+    local -a sans=()
+    while IFS= read -r _entry; do
+        [[ -n "${_entry}" ]] && sans+=("IP:${_entry}")
+    done < <(echo "${output}" | jq -r '.controller_ips.value[], .worker_ips.value[]' 2>/dev/null)
+    while IFS= read -r _entry; do
+        [[ -n "${_entry}" ]] && sans+=("DNS:${_entry}")
+    done < <(echo "${output}" | jq -r '.controller_public_dns.value[]? // empty, .worker_public_dns.value[]? // empty' 2>/dev/null)
+
+    fetch_current_mke4_yaml online
+    create_msr4_namespace online
+    generate_msr4_tls_cert "${fqdn}" "${sans[@]}"
+    create_msr4_tls_secret online
+    apply_msr4_k8s_resources online ""
+
+    # HA path: Round 1 does postgres + redis together (option B — single mkectl apply),
+    # then Round 2 (deploy_msr4_service) does msr. Simple path skips Round 1.
+    if [[ "${msr4_replicas}" -ge 2 ]]; then
+        deploy_msr4_ha_backends online "ghcr.io" "quay.io/opstree"
+    fi
+
+    deploy_msr4_service online "${fqdn}" "registry.mirantis.com"
+
+    print_msr4_summary online "${fqdn}"
+}
+
+# Airgap MSR4 deploy: uploads images+charts to bastion Harbor, runs
+# kubectl/mkectl on bastion (NLB is internal).
+cmd_deploy_msr4_airgap() {
+    load_config
+    [[ "${msr4_enabled}" == "true" ]] || die "msr4_enabled is not true in config"
+    msr4_preflight_ha_nodes
+
+    local output ssh_key bastion_ip
+    output="$(tf_output 2>/dev/null)" || die "Could not read terraform output. Has terraform been applied?"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+
+    [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" ]] \
+        || die "No bastion found — did you mean 't deploy msr4' (online)?"
+
+    info "Preflight: kubeconfig + nfs-client on bastion..."
+    ssh_node "${ssh_key}" "${bastion_ip}" "
+        set -e
+        [[ -f ~/.mke/mke.kubeconf ]] || { echo 'mke.kubeconf not on bastion'; exit 1; }
+        export KUBECONFIG=~/.mke/mke.kubeconf
+        kubectl get sc nfs-client >/dev/null || { echo 'nfs-client StorageClass missing'; exit 1; }
+    " || die "Airgap preflight failed. Ensure cluster + NFS are deployed first."
+
+    local fqdn="msr.${cluster_name}.local"
+
+    # Airgap SANs: private IPs + private EC2 DNS (reachable from bastion)
+    # + 127.0.0.1 so 't tunnel msr4 -> https://127.0.0.1:8444' validates too.
+    local -a sans=("IP:127.0.0.1")
+    while IFS= read -r _entry; do
+        [[ -n "${_entry}" ]] && sans+=("IP:${_entry}")
+    done < <(echo "${output}" | jq -r '.controller_private_ips.value[], .worker_private_ips.value[]' 2>/dev/null)
+    while IFS= read -r _entry; do
+        [[ -n "${_entry}" ]] && sans+=("DNS:${_entry}")
+    done < <(echo "${output}" | jq -r '.controller_private_dns.value[]? // empty, .worker_private_dns.value[]? // empty' 2>/dev/null)
+
+    upload_msr4_artifacts
+    fetch_current_mke4_yaml airgap
+    generate_msr4_tls_cert "${fqdn}" "${sans[@]}"
+    create_msr4_namespace airgap
+    create_msr4_tls_secret airgap
+    apply_msr4_k8s_resources airgap "${registry_hostname}"
+
+    # HA path: Round 1 does postgres + redis together (option B — single mkectl apply),
+    # then Round 2 (deploy_msr4_service) does msr. Simple path skips Round 1.
+    if [[ "${msr4_replicas}" -ge 2 ]]; then
+        deploy_msr4_ha_backends airgap "${registry_hostname}" "${registry_hostname}"
+    fi
+
+    deploy_msr4_service airgap "${fqdn}" "${registry_hostname}"
+
+    print_msr4_summary airgap "${fqdn}"
+}
+
 cmd_status() {
     local kc="${KUBECONFIG}"
     if [[ ! -f "${kc}" ]]; then
@@ -2902,12 +3979,25 @@ cmd_tunnel() {
             info "Harbor Registry is publicly accessible — no tunnel needed."
             info "  Open: https://${bastion_pub_ip}"
             ;;
+        msr4)
+            local ctrl_priv_ip
+            ctrl_priv_ip="$(echo "${output}" | jq -r '.controller_private_ips.value[0] // empty' 2>/dev/null)"
+            [[ -n "${ctrl_priv_ip}" && "${ctrl_priv_ip}" != "null" ]] \
+                || die "No controller private IP found. Is this an airgap cluster?"
+            info "Tunnelling MSR4 → https://localhost:8444"
+            info "  (via bastion ${bastion_pub_ip} → controller ${ctrl_priv_ip}:33443)"
+            info "  Remember: add '127.0.0.1 msr.${cluster_name}.local' to /etc/hosts for TLS to validate."
+            info "  Press Ctrl-C to stop."
+            ssh -o StrictHostKeyChecking=no -i "${ssh_key}" \
+                -L "0.0.0.0:8444:${ctrl_priv_ip}:33443" -N "ubuntu@${bastion_pub_ip}"
+            ;;
         "")
             echo ""
             echo -e "${BOLD}Available tunnels:${RESET}"
             echo ""
             echo "  t tunnel dashboard    MKE4k Dashboard → https://localhost:3000"
             echo "  t tunnel mke3         MKE3 Dashboard  → https://localhost:3000"
+            echo "  t tunnel msr4         MSR4 Harbor UI  → https://localhost:8444"
             echo ""
             echo -e "${BOLD}Harbor Registry (no tunnel needed — publicly accessible):${RESET}"
             echo "  https://${bastion_pub_ip}"
@@ -2922,15 +4012,22 @@ cmd_tunnel() {
                 echo "  ssh -i ${ssh_key} -L 0.0.0.0:3000:${mke3_lb_dns}:443 -N ubuntu@${bastion_pub_ip}"
                 echo ""
             fi
+            local ctrl_priv_ip
+            ctrl_priv_ip="$(echo "${output}" | jq -r '.controller_private_ips.value[0] // empty' 2>/dev/null)"
+            if [[ -n "${ctrl_priv_ip}" && "${ctrl_priv_ip}" != "null" ]]; then
+                echo "  # MSR4 Harbor (via controller NodePort)"
+                echo "  ssh -i ${ssh_key} -L 0.0.0.0:8444:${ctrl_priv_ip}:33443 -N ubuntu@${bastion_pub_ip}"
+                echo ""
+            fi
             echo "  # Kubernetes API (for local kubectl)"
             echo "  ssh -i ${ssh_key} -L 0.0.0.0:6443:${lb_dns}:6443 -N ubuntu@${bastion_pub_ip}"
             echo ""
             if [[ -t 0 ]]; then
-                echo -e "${CYAN}Note: If running inside Docker, start with -p 3000:3000${RESET}"
+                echo -e "${CYAN}Note: inside Docker, start with -p 3000:3000 -p 8443:8443 -p 8444:8444${RESET}"
             fi
             ;;
         *)
-            die "Unknown tunnel target: ${target}. Try: dashboard, mke3"
+            die "Unknown tunnel target: ${target}. Try: dashboard, mke3, msr4, registry"
             ;;
     esac
 }
@@ -3026,6 +4123,8 @@ usage() {
     echo "  deploy registry             Setup MSR4 + upload MKE4k bundle"
     echo "  deploy registry mke3        Setup MSR4 + upload MKE3 images"
     echo "  deploy nfs                  Setup NFS server + CSI driver (cluster must exist)"
+    echo "  deploy msr4                 Deploy MSR4 (Harbor) on existing cluster"
+    echo "  deploy msr4 airgap          Deploy MSR4 via bastion Harbor registry"
     echo "  destroy cluster             Uninstall MKE4k (mkectl reset)"
     echo "  destroy cluster mke3        Uninstall MKE3 (launchpad reset)"
     echo "  destroy cluster airgap      Uninstall MKE4k from bastion"
@@ -3042,6 +4141,7 @@ usage() {
     echo "  tunnel                      Show available SSH tunnels for airgap UIs"
     echo "  tunnel dashboard            MKE4k Dashboard → https://localhost:3000"
     echo "  tunnel mke3                 MKE3 Dashboard  → https://localhost:3000"
+    echo "  tunnel msr4                 MSR4 Harbor UI  → https://localhost:8444"
     echo ""
     echo "Prerequisites:"
     echo "  - AWS credentials exported (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)"
@@ -3094,7 +4194,14 @@ case "${COMMAND}" in
                 esac
                 ;;
             nfs) cmd_deploy_nfs ;;
-            *)         die "Unknown subcommand: t deploy ${SUBCOMMAND}. Try: lab, instances, cluster, registry, nfs" ;;
+            msr4)
+                case "${3:-}" in
+                    "")      cmd_deploy_msr4 ;;
+                    airgap)  cmd_deploy_msr4_airgap ;;
+                    *)       die "Unknown variant: t deploy msr4 ${3}. Try: (empty), airgap" ;;
+                esac
+                ;;
+            *)         die "Unknown subcommand: t deploy ${SUBCOMMAND}. Try: lab, instances, cluster, registry, nfs, msr4" ;;
         esac
         ;;
     destroy)

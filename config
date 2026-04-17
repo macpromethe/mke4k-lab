@@ -33,7 +33,7 @@ os_distro="ubuntu-22.04"
 # true  -> IAM role + policy created; CCM enabled in mke4.yaml.
 #          Required for LoadBalancer services and EBS volumes.
 # false -> no IAM resources; cloudProvider disabled in mke4.yaml.
-ccm_enabled=true
+ccm_enabled=false
 
 # -- Debug mode ----------------------------------------------
 # true -> mkectl runs with -l debug (very verbose output).
@@ -44,7 +44,7 @@ debug=false
 # ============================================================
 # mkectl is downloaded automatically at this version on first use.
 # Releases: https://github.com/MirantisContainers/mke-release/releases
-mke4k_version="v4.1.2"
+mke4k_version="v4.1.3"
 
 # ============================================================
 #  MKE3 settings   (t deploy lab mke3)
@@ -95,7 +95,7 @@ airgap_msr_version="v4.13.3"
 # true  -> provisions a dedicated NFS server EC2, installs nfs-common on
 #          all cluster nodes, and deploys the nfs-subdir-external-provisioner + default StorageClass.
 # false -> no NFS resources created (default).
-nfs_enabled=false
+nfs_enabled=true
 
 # EC2 instance type for the NFS server.
 nfs_flavor="t3.small"
@@ -105,3 +105,29 @@ nfs_disk_gb=50
 
 # NFS export path on the server.
 nfs_export_path="/srv/nfs/data"
+
+# ============================================================
+#  MSR4 settings   (t deploy msr4 / t deploy msr4 airgap)
+# ============================================================
+# true  -> enables MSR4 (Harbor) deployment on the running MKE4k cluster.
+#          Run 't deploy msr4' (or 't deploy msr4 airgap') after the cluster
+#          and NFS StorageClass are up. Does NOT auto-run during 't deploy lab'.
+# false -> MSR4 commands refuse to run (default).
+msr4_enabled=false
+
+# Harbor chart version deployed on the cluster.
+# NOTE: airgap_msr_version controls the *bastion* registry (separate).
+msr4_version="4.13.3"
+
+# Replicas for the Harbor Service.
+#   1    -> simple mode: built-in DB + Redis (single pod each)
+#   2+   -> HA mode: external postgres-operator + redis-operator (requires NFS StorageClass)
+msr4_replicas=1
+
+# Component versions used in HA mode (msr4_replicas >= 2).
+msr4_postgres_version="1.15.1"
+msr4_redis_operator_version="0.24.0"
+msr4_redis_replication_version="0.16.13"
+
+# PVC size for the MSR4 registry volume. Requires nfs_enabled=true.
+msr4_storage_size="10Gi"

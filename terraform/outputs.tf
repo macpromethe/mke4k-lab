@@ -48,6 +48,26 @@ output "worker_private_ips" {
   value       = aws_instance.cluster-workers[*].private_ip
 }
 
+output "controller_public_dns" {
+  description = "Public DNS names of controller nodes (empty strings in airgap)"
+  value       = aws_instance.cluster-controller[*].public_dns
+}
+
+output "worker_public_dns" {
+  description = "Public DNS names of worker nodes (empty strings in airgap)"
+  value       = aws_instance.cluster-workers[*].public_dns
+}
+
+output "controller_private_dns" {
+  description = "Private DNS names (ip-X-Y-Z.<region>.compute.internal) of controller nodes"
+  value       = aws_instance.cluster-controller[*].private_dns
+}
+
+output "worker_private_dns" {
+  description = "Private DNS names of worker nodes"
+  value       = aws_instance.cluster-workers[*].private_dns
+}
+
 output "nfs_server_private_ip" {
   description = "Private IP of the NFS server"
   value       = var.nfs_enabled ? aws_instance.nfs_server[0].private_ip : ""
