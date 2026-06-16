@@ -1,0 +1,58 @@
+# Grafana instance for KOF, reconciled by the grafana-operator (enabled via
+# kof-operators.values.grafana-operator.enabled). Mirantis no longer ships Grafana
+# as part of KOF, so the instance is applied as a separate, version-pinned asset.
+#
+# - Image is pinned explicitly to the k0rdent-enterprise registry. The KOF 1.8.1
+#   doc uses spec.version 10.4.18-security-01, but that tag is not in the registry;
+#   the registry ships grafana/grafana:11.0.0. The grafana-operator would otherwise
+#   derive docker.io/grafana/grafana:<version>, which lacks that tag.
+# - 't deploy kof' applies the kof_registry seam (registry override) and substitutes
+#   the image tag (kof_grafana_image_tag) into this file before applying it.
+# - Admin credentials come from the chart-created secret 'grafana-admin-credentials'
+#   (kof-mothership.values.grafana.security.create_secret); disableDefaultAdminSecret
+#   stops the operator from generating its own.
+# - The datasources (metrics/logs/traces/alertmanager) and dashboards are created by
+#   the kof-mothership chart when grafana.enabled=true; this CR is just the instance.
+apiVersion: grafana.integreatly.org/v1beta1
+kind: Grafana
+metadata:
+  name: grafana-vm
+  namespace: kof
+  labels:
+    dashboards: grafana
+spec:
+  version: 11.0.0
+  disableDefaultAdminSecret: true
+  persistentVolumeClaim:
+    spec:
+      accessModes:
+        - ReadWriteOnce
+      resources:
+        requests:
+          storage: 200Mi
+  deployment:
+    spec:
+      template:
+        spec:
+          securityContext:
+            fsGroup: 472
+          volumes:
+            - name: grafana-data
+              persistentVolumeClaim:
+                claimName: grafana-vm-pvc
+          containers:
+            - name: grafana
+              image: registry.mirantis.com/k0rdent-enterprise/grafana/grafana:11.0.0
+              env:
+                - name: GF_SECURITY_ADMIN_USER
+                  valueFrom:
+                    secretKeyRef:
+                      key: GF_SECURITY_ADMIN_USER
+                      name: grafana-admin-credentials
+                - name: GF_SECURITY_ADMIN_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      key: GF_SECURITY_ADMIN_PASSWORD
+                      name: grafana-admin-credentials
+                - name: GF_INSTALL_PLUGINS
+                  value: "victoriametrics-logs-datasource 0.21.0,victoriametrics-metrics-datasource 0.19.4"

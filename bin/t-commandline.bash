@@ -123,6 +123,18 @@ load_config() {
     msr4_redis_operator_version="${msr4_redis_operator_version:-0.24.0}"
     msr4_redis_replication_version="${msr4_redis_replication_version:-0.16.13}"
     msr4_storage_size="${msr4_storage_size:-10Gi}"
+
+    # KOF defaults
+    kof_enabled="${kof_enabled:-false}"
+    kof_version="${kof_version:-1.8.1}"
+    kof_storage_size="${kof_storage_size:-10Gi}"
+    kof_registry="${kof_registry:-registry.mirantis.com/k0rdent-enterprise}"
+    kof_kcm_namespace="${kof_kcm_namespace:-k0rdent}"
+    kof_grafana_enabled="${kof_grafana_enabled:-false}"
+    kof_grafana_image_tag="${kof_grafana_image_tag:-11.0.0}"
+    kof_grafana_gateway_enabled="${kof_grafana_gateway_enabled:-false}"
+    kof_grafana_nodeport="${kof_grafana_nodeport:-33002}"
+    kof_grafana_lb_port="${kof_grafana_lb_port:-8443}"
 }
 
 msr4_credentials_file() {
@@ -169,6 +181,9 @@ airgap_registry_disk_gb  = ${airgap_registry_disk_gb}
 nfs_enabled              = ${nfs_enabled}
 nfs_flavor               = "${nfs_flavor}"
 nfs_disk_gb              = ${nfs_disk_gb}
+kof_grafana_gateway_enabled = ${kof_grafana_gateway_enabled:-false}
+kof_grafana_nodeport     = ${kof_grafana_nodeport:-33002}
+kof_grafana_lb_port      = ${kof_grafana_lb_port:-8443}
 EOF
     info "Wrote terraform/terraform.tfvars"
 }
@@ -2234,6 +2249,25 @@ print_deploy_summary() {
         lb_remaining="${lb_remaining:${lb_chunk_w}}"
     done
     bline "    ${lb_remaining}"
+    if [[ "${kof_enabled:-false}" == "true" ]]; then
+        sep
+        bline "  KOF (observability / M2M)"
+        if [[ "${kof_grafana_enabled:-false}" == "true" && "${kof_grafana_gateway_enabled:-false}" == "true" ]]; then
+            bline "    Grafana (HTTPS, self-signed):"
+            local chunk=$(( W - 6 )) gurl="https://${lb_dns}:${kof_grafana_lb_port}"
+            while [[ ${#gurl} -gt ${chunk} ]]; do
+                bline "      ${gurl:0:${chunk}}"
+                gurl="${gurl:${chunk}}"
+            done
+            bline "      ${gurl}"
+            bline "      (or https://<node-ip>:${kof_grafana_nodeport})"
+        elif [[ "${kof_grafana_enabled:-false}" == "true" ]]; then
+            bline "    Grafana: kubectl -n kof port-forward"
+            bline "      svc/grafana-vm-service 3000:3000 -> :3000"
+        else
+            bline "    Grafana: not enabled (kof_grafana_enabled)"
+        fi
+    fi
     sep
     bline "  kubectl get nodes"
     printf "╚%s╝\n" "${SEP}"
@@ -2536,6 +2570,9 @@ cmd_deploy_lab_mke4() {
         deploy_nfs_provisioner
         timer_phase_end _T_NFS
     fi
+    if [[ "${kof_enabled}" == "true" ]]; then
+        cmd_deploy_kof
+    fi
     print_deploy_summary
     export KUBECONFIG=/root/.mke/mke.kubeconf
 }
@@ -2806,6 +2843,343 @@ cmd_deploy_nfs() {
         deploy_nfs_provisioner
     fi
     success "NFS setup complete."
+}
+
+# ---------------------------------------------------------------------------
+# KOF (k0rdent Observability & FinOps) — online self-monitoring (M2M) mode
+# ---------------------------------------------------------------------------
+# Targets KOF 1.8.x as shipped with k0rdent Enterprise 1.3.2 (MKE 4.2.0).
+# M2M (Management-to-Management): the cluster stores its own metrics/logs/traces
+# locally — no regional cluster, no child ClusterDeployment, no external DNS, no
+# Istio. For 1.8.x this is expressed as kof-storage.enabled=true + a kof-collectors
+# patch (NOT the 1.10+ 'regionless' / fromManagement form).
+# KOF is a FluxCD-sequenced OCI umbrella Helm chart; installed with helm v3
+# (helm v4 has a webhook bug, kof issue #715 — the container ships helm v3).
+# Depends on a StorageClass (the 'nfs' add-on provides default 'nfs-client').
+# ---------------------------------------------------------------------------
+
+kof_preflight() {
+    local tool
+    for tool in helm yq kubectl; do
+        command -v "${tool}" >/dev/null 2>&1 \
+            || die "KOF requires '${tool}' in PATH."
+    done
+    kubectl get nodes >/dev/null 2>&1 \
+        || die "Cluster not reachable via KUBECONFIG=${KUBECONFIG}. Deploy the cluster first."
+    [[ -f "${PROJECT_ROOT}/kof/global-values.yaml" ]] \
+        || die "Missing committed asset ${PROJECT_ROOT}/kof/global-values.yaml."
+    [[ "${kof_grafana_enabled}" != "true" || -f "${PROJECT_ROOT}/kof/grafana.yaml" ]] \
+        || die "kof_grafana_enabled=true but missing committed asset ${PROJECT_ROOT}/kof/grafana.yaml."
+    if [[ "${kof_grafana_gateway_enabled}" == "true" ]]; then
+        [[ "${kof_grafana_enabled}" == "true" ]] \
+            || die "kof_grafana_gateway_enabled=true requires kof_grafana_enabled=true."
+        [[ -f "${PROJECT_ROOT}/kof/grafana-gateway.yaml" ]] \
+            || die "kof_grafana_gateway_enabled=true but missing committed asset ${PROJECT_ROOT}/kof/grafana-gateway.yaml."
+    fi
+    kubectl get ns "${kof_kcm_namespace}" >/dev/null 2>&1 \
+        || die "k0rdent (KCM) namespace '${kof_kcm_namespace}' not found. Set kof_kcm_namespace in config to the namespace where k0rdent runs (check 'kubectl get ns')."
+}
+
+# Echo a usable StorageClass: cluster default, else 'nfs-client', else die.
+kof_resolve_storageclass() {
+    local sc
+    sc="$(kubectl get sc \
+        -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{"\n"}{end}' \
+        2>/dev/null | head -n1)"
+    if [[ -z "${sc}" ]]; then
+        if kubectl get sc nfs-client >/dev/null 2>&1; then
+            sc="nfs-client"
+        else
+            die "No default StorageClass and no 'nfs-client' found. Run 't deploy nfs' (or set nfs_enabled=true) first."
+        fi
+    fi
+    printf '%s\n' "${sc}"
+}
+
+# MKE4k ships a built-in ucpauthz Validating Admission Policy that blocks
+# service accounts (e.g. kof's opentelemetry-operator) from creating workloads
+# like DaemonSets. Left in place, KOF's collector CRs reconcile but their
+# DaemonSets are never created (no node/host-log collection). Exempt the kof
+# namespace + operator SA via mkectl BEFORE installing KOF.
+# Idempotent: merges into any existing exemptions and only re-applies the
+# cluster config when the exemption is missing (mkectl apply is heavyweight).
+kof_exempt_ucpauthz() {
+    ensure_mkectl
+
+    local cfg ns_sa
+    ns_sa="system:serviceaccount:kof:opentelemetry-operator"
+    cfg="$(mktemp "${TMPDIR:-/tmp}/kof-ucpauthz-XXXX.yaml")"
+
+    info "Checking MKE ucpauthz admission-policy exemptions..."
+    mkectl config get 2>/dev/null | sed -n '/^apiVersion:/,$p' > "${cfg}"
+    [[ -s "${cfg}" ]] || { rm -f "${cfg}"; die "mkectl config get returned empty output. Is the cluster up?"; }
+
+    if NS_SA="${ns_sa}" yq -e '
+        ((.spec.apiServer.ucpauthz.exemptNamespaces // []) | contains(["kof"]))
+        and ((.spec.apiServer.ucpauthz.exemptUsers // []) | contains([strenv(NS_SA)]))
+    ' "${cfg}" >/dev/null 2>&1; then
+        info "  ucpauthz already exempts kof — skipping mkectl apply."
+    else
+        info "Exempting kof from ucpauthz and applying cluster config (mkectl)..."
+        NS_SA="${ns_sa}" yq -i '
+            .spec.apiServer.ucpauthz.disabled = (.spec.apiServer.ucpauthz.disabled // false)
+          | .spec.apiServer.ucpauthz.exemptNamespaces = ((.spec.apiServer.ucpauthz.exemptNamespaces // []) + ["kof"] | unique)
+          | .spec.apiServer.ucpauthz.exemptUsers = ((.spec.apiServer.ucpauthz.exemptUsers // []) + [strenv(NS_SA)] | unique)
+        ' "${cfg}"
+
+        local debug_flag=""
+        [[ "${debug:-false}" == "true" ]] && debug_flag="-l debug"
+        mkectl ${debug_flag} apply -f "${cfg}" \
+            --skip-helm-extensions-check --skip-cni-check --cni-check-timeout 1
+        success "ucpauthz exemption applied."
+    fi
+
+    rm -f "${cfg}"
+    return 0
+}
+
+# Apply the Grafana instance CR (the chart enables the operator + datasources but
+# does NOT create the instance). Pins image+version explicitly to the configured
+# registry/tag so the operator doesn't try docker.io/grafana/grafana:<version>.
+# Must run after the chart install so the grafana-operator + CRDs exist.
+kof_install_grafana() {
+    local gf
+    gf="$(mktemp "${TMPDIR:-/tmp}/kof-grafana-XXXX.yaml")"
+    cp "${PROJECT_ROOT}/kof/grafana.yaml" "${gf}"
+    GF_IMG="${kof_registry}/grafana/grafana:${kof_grafana_image_tag}" TAG="${kof_grafana_image_tag}" yq -i '
+        .spec.version = strenv(TAG)
+      | (.spec.deployment.spec.template.spec.containers[] | select(.name == "grafana") | .image) = strenv(GF_IMG)
+    ' "${gf}"
+
+    info "Applying Grafana instance (image ${kof_registry}/grafana/grafana:${kof_grafana_image_tag})..."
+    kubectl wait --for=condition=Established crd/grafanas.grafana.integreatly.org --timeout=5m || true
+    kubectl apply -n kof -f "${gf}"
+    rm -f "${gf}"
+
+    info "Waiting for Grafana instance to become ready..."
+    kubectl wait grafana grafana-vm -n kof \
+        --for=jsonpath='{.status.stageStatus}'=success --timeout=5m || true
+    return 0
+}
+
+# Apply the dedicated Grafana Envoy Gateway (Issuer/Certificate/EnvoyProxy/Gateway/
+# HTTPRoute). Pins the Envoy NodePort to kof_grafana_nodeport so the terraform NLB
+# target group hits a known port, and fills the cert SANs from terraform output.
+kof_install_grafana_gateway() {
+    local output lb_dns
+    output="$(tf_output 2>/dev/null)" || die "Could not read terraform output for the Grafana gateway."
+    lb_dns="$(echo "${output}" | jq -r '.lb_dns_name.value // empty')"
+    local -a sans_ip=()
+    mapfile -t sans_ip < <(echo "${output}" | jq -r '(.controller_ips.value // [])[], (.worker_ips.value // [])[]' 2>/dev/null)
+
+    local gw
+    gw="$(mktemp "${TMPDIR:-/tmp}/kof-gw-XXXX.yaml")"
+    cp "${PROJECT_ROOT}/kof/grafana-gateway.yaml" "${gw}"
+
+    NP="${kof_grafana_nodeport}" yq -i '
+        (select(.kind == "EnvoyProxy").spec.provider.kubernetes.envoyService.patch.value.spec.ports[0].nodePort)
+        = (strenv(NP) | tonumber)
+    ' "${gw}"
+
+    # Cert SANs: NLB DNS + node public IPs (fall back to a placeholder if neither).
+    yq -i '(select(.kind == "Certificate").spec.dnsNames) = [] | (select(.kind == "Certificate").spec.ipAddresses) = []' "${gw}"
+    [[ -n "${lb_dns}" ]] && D="${lb_dns}" yq -i '(select(.kind == "Certificate").spec.dnsNames) += [strenv(D)]' "${gw}"
+    local ip
+    for ip in "${sans_ip[@]}"; do
+        [[ -n "${ip}" ]] && IP="${ip}" yq -i '(select(.kind == "Certificate").spec.ipAddresses) += [strenv(IP)]' "${gw}"
+    done
+    if [[ -z "${lb_dns}" && ${#sans_ip[@]} -eq 0 ]]; then
+        yq -i '(select(.kind == "Certificate").spec.dnsNames) = ["grafana.kof.local"]' "${gw}"
+    fi
+
+    info "Applying Grafana Envoy gateway (NodePort ${kof_grafana_nodeport}, NLB :${kof_grafana_lb_port})..."
+    kubectl apply -f "${gw}"
+    rm -f "${gw}"
+
+    kubectl wait --for=condition=Ready certificate/kof-grafana -n kof --timeout=2m || true
+    kubectl wait --for=condition=Programmed gateway/kof-grafana -n kof --timeout=3m || true
+    return 0
+}
+
+cmd_deploy_kof() {
+    load_config
+    kof_preflight
+
+    local sc
+    sc="$(kof_resolve_storageclass)"
+    info "KOF deploy: version=${kof_version} storageClass=${sc} kcmNamespace=${kof_kcm_namespace} registry=${kof_registry}"
+
+    # Must run before the chart install so the operator can create collector
+    # DaemonSets without being rejected by MKE's admission policy.
+    kof_exempt_ucpauthz
+
+    # Grafana-over-gateway needs an NLB listener + SG NodePort rule (terraform).
+    # Reconcile infra here so standalone 't deploy kof' also gets them (idempotent
+    # — a no-op when 't deploy lab' already applied with the gateway enabled).
+    if [[ "${kof_grafana_gateway_enabled}" == "true" ]]; then
+        info "Ensuring NLB listener + SG NodePort for the Grafana gateway (terraform)..."
+        write_tfvars false false
+        tf_init
+        tf_apply
+    fi
+
+    local workdir
+    workdir="$(mktemp -d "${TMPDIR:-/tmp}/kof-XXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '${workdir}'" RETURN
+
+    cp "${PROJECT_ROOT}/kof/global-values.yaml" "${workdir}/global-values.yaml"
+    cd "${workdir}"
+
+    # Airgap seam (no-op online): repoint every image to a custom registry.
+    if [[ "${kof_registry}" != "registry.mirantis.com/k0rdent-enterprise" ]]; then
+        info "Repointing KOF images to ${kof_registry}..."
+        sed -i "s#registry.mirantis.com/k0rdent-enterprise#${kof_registry}#g" global-values.yaml
+    fi
+
+    # Shrink VictoriaMetrics / VictoriaLogs / VictoriaTraces volumes for lab use.
+    SIZE="${kof_storage_size}" yq -i '
+        .victoriametrics.vmcluster.spec.vmstorage.storage.volumeClaimTemplate.spec.resources.requests.storage = strenv(SIZE)
+      | .victoria-logs-cluster.vlstorage.persistentVolume.size = strenv(SIZE)
+      | .victoria-traces-cluster.vtstorage.persistentVolume.size = strenv(SIZE)
+    ' global-values.yaml
+
+    # Generate the umbrella-chart components file (verbatim install-doc commands).
+    yq -n 'load("global-values.yaml") as $gv
+      | "operators mothership regional child storage collectors" / " "
+      | map({"key": ("kof-" + .), "value": {"values": $gv}})
+      | $gv * from_entries' > global-components.yaml
+
+    yq -i 'load("global-values.yaml") as $gv
+      | .kof-regional.values.operators = $gv
+      | .kof-regional.values.storage *= $gv
+      | .kof-regional.values.collectors = $gv
+      | .kof-child.values.operators = $gv
+      | .kof-child.values.collectors = $gv
+      | .victoria-metrics-operator as $vmo
+      | .global as $g
+      | .victoria-metrics-operator.values = $vmo
+      | .victoria-metrics-operator.values.global = $g' global-components.yaml
+
+    # M2M patch + resolved StorageClass + KCM namespace.
+    # The KOF umbrella + mothership charts default every k0rdent (KCM) namespace
+    # to "kcm-system", but MKE4k's k0rdent Enterprise build runs KCM in
+    # ${kof_kcm_namespace}. Repoint all of them, or helm pre-install hooks fail
+    # with 'namespaces "kcm-system" not found':
+    #   - global.helmRepo.namespace            : umbrella Flux HelmRepository/HelmChart
+    #   - kof-mothership.values.kcm.namespace   : KCM integration
+    #   - kof-mothership.values.*-service-template.namespace : kgst hooks create a
+    #     Flux HelmRepository per ServiceTemplate (cert-manager/ingress-nginx/envoy)
+    #   - kof-collectors.values.kcm.namespace + global.clusterNamespace
+    # M2M is self-monitoring only: kof-regional / kof-child install regional/child
+    # cluster templates (and pull in istio/external-dns/envoy service templates),
+    # none of which apply here — disable them (also avoids their kcm-system hooks).
+    # The mothership cluster labels are aligned to the same namespace for a
+    # consistent cluster identity.
+    # KOF's bundled prometheus-node-exporter defaults to hostNetwork: true, so it
+    # binds the node's :9100 — which MKE4k's built-in monitoring node-exporter
+    # already owns on every node, leaving KOF's pods Pending ("no free ports").
+    # Run KOF's on the pod network instead (hostNetwork: false): it gets a pod IP,
+    # binds 9100 only in its own netns, and is scraped via its pod endpoint through
+    # the ServiceMonitor. This matches how KOF coexists with an existing
+    # host-networked node-exporter on real clusters. (CPU/mem/disk metrics come
+    # from the /host hostPath mounts and are unaffected; only network-interface
+    # metrics reflect the pod netns.)
+    SC="${sc}" KCM_NS="${kof_kcm_namespace}" yq -n '
+        .global.helmRepo.namespace = strenv(KCM_NS)
+      | .["kof-regional"].enabled = false
+      | .["kof-child"].enabled = false
+      | .["kof-mothership"].values.global.storageClass = strenv(SC)
+      | .["kof-mothership"].values.kcm.namespace = strenv(KCM_NS)
+      | .["kof-mothership"].values["cert-manager-service-template"].namespace = strenv(KCM_NS)
+      | .["kof-mothership"].values["ingress-nginx-service-template"].namespace = strenv(KCM_NS)
+      | .["kof-mothership"].values["envoy-gateway-service-template"].namespace = strenv(KCM_NS)
+      | .["kof-storage"].enabled = true
+      | .["kof-storage"].values.global.storageClass = strenv(SC)
+      | .["kof-collectors"].enabled = true
+      | .["kof-collectors"].values.kcm.monitoring = true
+      | .["kof-collectors"].values.kcm.namespace = strenv(KCM_NS)
+      | .["kof-collectors"].values.global.clusterNamespace = strenv(KCM_NS)
+      | .["kof-collectors"].values["opentelemetry-kube-stack"]["prometheus-node-exporter"].hostNetwork = false
+      | .["kof-collectors"].values["opentelemetry-kube-stack"].clusterName = "mothership"
+      | .["kof-collectors"].values["opentelemetry-kube-stack"].defaultCRConfig.config.processors["resource/k8sclustername"].attributes = [
+            {"action": "insert", "key": "k8s.cluster.name", "value": "mothership"},
+            {"action": "insert", "key": "k8s.cluster.namespace", "value": strenv(KCM_NS)}
+        ]
+      | .["kof-collectors"].values["opentelemetry-kube-stack"].defaultCRConfig.config.exporters.prometheusremotewrite.external_labels.cluster = "mothership"
+      | .["kof-collectors"].values["opentelemetry-kube-stack"].defaultCRConfig.config.exporters.prometheusremotewrite.external_labels.clusterNamespace = strenv(KCM_NS)
+    ' > kof-values.yaml
+    # NOTE: MKE4k is k0s and KOF's default PKI_PATH is already var/lib/k0s, so NO
+    # collector env override (PKI_PATH) is needed here. Only non-k0s clusters
+    # (e.g. kind -> etc/kubernetes) require it. Add it under
+    # opentelemetry-kube-stack.defaultCRConfig.env only if etcd-metrics scraping
+    # fails on a given MKE4k build.
+
+    # Grafana (opt-in): turn on the grafana-operator + the mothership's Grafana
+    # datasources/dashboards/admin-secret. The Grafana *instance* itself is applied
+    # separately after install (kof_install_grafana) — the chart does not create it.
+    if [[ "${kof_grafana_enabled}" == "true" ]]; then
+        yq -i '
+            .["kof-operators"].values["grafana-operator"].enabled = true
+          | .["kof-mothership"].values.grafana.enabled = true
+        ' kof-values.yaml
+    fi
+
+    info "Installing KOF umbrella chart (helm v3, FluxCD-sequenced)..."
+    helm upgrade -i --reset-values --wait \
+        --create-namespace -n kof kof \
+        "oci://${kof_registry}/charts/kof" \
+        --version "${kof_version}" \
+        -f global-components.yaml \
+        -f kof-values.yaml
+
+    info "Waiting for KOF HelmReleases to become Ready (Flux-driven)..."
+    kubectl wait --for=condition=Ready helmreleases --all -n kof --timeout=10m || true
+    kubectl get hr -n kof || true
+    kubectl get pod -n kof || true
+
+    if [[ "${kof_grafana_enabled}" == "true" ]]; then
+        kof_install_grafana
+        if [[ "${kof_grafana_gateway_enabled}" == "true" ]]; then
+            kof_install_grafana_gateway
+        fi
+    fi
+
+    cd "${PROJECT_ROOT}"
+    echo ""
+    echo -e "  ${BOLD}KOF access (self-monitoring / M2M):${RESET}"
+    echo -e "    List services:  kubectl get svc -n kof"
+    if [[ "${kof_grafana_enabled}" == "true" ]]; then
+        if [[ "${kof_grafana_gateway_enabled}" == "true" ]]; then
+            local _lb_dns
+            _lb_dns="$(tf_output 2>/dev/null | jq -r '.lb_dns_name.value // empty' 2>/dev/null)"
+            echo -e "    Grafana (HTTPS): https://${_lb_dns:-<nlb-dns>}:${kof_grafana_lb_port}  (self-signed; accept the cert)"
+            echo -e "                     or https://<node-public-ip>:${kof_grafana_nodeport}"
+        else
+            echo -e "    Grafana:        kubectl -n kof port-forward svc/grafana-vm-service 3000:3000"
+            echo -e "                    then open http://localhost:3000  (dashboards + metrics/logs/traces datasources)"
+        fi
+        echo -e "    Grafana creds:  kubectl get secret -n kof grafana-admin-credentials -o yaml | yq '{\"user\": .data.GF_SECURITY_ADMIN_USER | @base64d, \"pass\": .data.GF_SECURITY_ADMIN_PASSWORD | @base64d}'"
+    else
+        echo -e "    Grafana:        not deployed (set kof_grafana_enabled=true). Built-in VMUI below:"
+    fi
+    echo -e "    Logs (VMUI):    kubectl -n kof port-forward svc/kof-storage-victoria-logs-cluster-vlselect 9471:9471"
+    echo -e "                    then open http://localhost:9471/select/vmui/"
+    echo -e "    Metrics (VMUI): kubectl -n kof port-forward svc/vmselect-cluster 8481:8481"
+    echo -e "                    then open http://localhost:8481/select/0/vmui/"
+    echo ""
+    success "KOF deployed."
+    return 0
+}
+
+cmd_destroy_kof() {
+    load_config
+    info "Removing KOF..."
+    helm uninstall kof -n kof || true
+    kubectl delete ns kof --wait=false || true
+    warn "If namespace 'kof' hangs in Terminating, PVCs/finalizers may need manual cleanup."
+    success "KOF removed."
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -4125,10 +4499,12 @@ usage() {
     echo "  deploy nfs                  Setup NFS server + CSI driver (cluster must exist)"
     echo "  deploy msr4                 Deploy MSR4 (Harbor) on existing cluster"
     echo "  deploy msr4 airgap          Deploy MSR4 via bastion Harbor registry"
+    echo "  deploy kof                  Deploy KOF observability/FinOps (self-monitoring; cluster must exist)"
     echo "  destroy cluster             Uninstall MKE4k (mkectl reset)"
     echo "  destroy cluster mke3        Uninstall MKE3 (launchpad reset)"
     echo "  destroy cluster airgap      Uninstall MKE4k from bastion"
     echo "  destroy cluster mke3-airgap Uninstall MKE3 from bastion"
+    echo "  destroy kof                 Uninstall KOF (helm uninstall + delete ns kof)"
     echo "  destroy lab                 Destroy all AWS infrastructure (terraform destroy)"
     echo "  status                      Show cluster node status (kubectl get nodes)"
     echo "  show nodes                  Print controller/worker IPs and load balancer DNS"
@@ -4201,7 +4577,8 @@ case "${COMMAND}" in
                     *)       die "Unknown variant: t deploy msr4 ${3}. Try: (empty), airgap" ;;
                 esac
                 ;;
-            *)         die "Unknown subcommand: t deploy ${SUBCOMMAND}. Try: lab, instances, cluster, registry, nfs, msr4" ;;
+            kof) cmd_deploy_kof ;;
+            *)         die "Unknown subcommand: t deploy ${SUBCOMMAND}. Try: lab, instances, cluster, registry, nfs, msr4, kof" ;;
         esac
         ;;
     destroy)
@@ -4216,7 +4593,8 @@ case "${COMMAND}" in
                     *)           die "Unknown variant: t destroy cluster ${3}. Try: mke4, mke3, airgap, mke3-airgap" ;;
                 esac
                 ;;
-            *)       die "Unknown subcommand: t destroy ${SUBCOMMAND}. Try: lab, cluster" ;;
+            kof)     cmd_destroy_kof ;;
+            *)       die "Unknown subcommand: t destroy ${SUBCOMMAND}. Try: lab, cluster, kof" ;;
         esac
         ;;
     status)    cmd_status ;;

@@ -129,6 +129,15 @@ resource "aws_security_group" "cluster_allow_ssh" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # KOF Grafana gateway NodePort
+  ingress {
+    description = "KOF Grafana gateway NodePort"
+    from_port   = var.kof_grafana_nodeport
+    to_port     = var.kof_grafana_nodeport
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   # HTTP ingress
   ingress {
     description = "HTTP"

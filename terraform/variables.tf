@@ -85,3 +85,21 @@ variable "nfs_disk_gb" {
   default     = 50
   description = "Root volume size in GB for the NFS server"
 }
+
+variable "kof_grafana_gateway_enabled" {
+  type        = bool
+  default     = false
+  description = "When true, add an NLB listener + target group forwarding to the KOF Grafana Envoy gateway NodePort"
+}
+
+variable "kof_grafana_nodeport" {
+  type        = number
+  default     = 33002
+  description = "NodePort the KOF Grafana Envoy gateway is pinned to (opened in the cluster SG; NLB forwards here)"
+}
+
+variable "kof_grafana_lb_port" {
+  type        = number
+  default     = 8443
+  description = "NLB listener port for KOF Grafana (TCP pass-through; the gateway terminates TLS)"
+}

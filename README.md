@@ -168,6 +168,32 @@ Exposed as `NodePort 33443` (HTTPS) on every cluster node. Two-tier TLS PKI; ser
 - Airgap: `t tunnel msr4` -> `https://localhost:8444` (requires `/etc/hosts: 127.0.0.1 msr.<cluster>.local` if you want to use the FQDN URL)
 - Admin credentials: generated on first deploy, saved to `terraform/msr4_credentials.txt`
 
+### KOF (observability & FinOps) on cluster
+
+| Command | Description |
+|---|---|
+| `t deploy kof` | Deploy KOF self-monitoring stack on existing MKE4k cluster (online) |
+| `t destroy kof` | Uninstall KOF (helm uninstall + delete namespace) |
+
+KOF (k0rdent Observability & FinOps) is deployed in **online self-monitoring (M2M) mode**: the MKE4k cluster stores its own metrics, logs, and traces locally — no regional cluster, no child `ClusterDeployment`, no external DNS, no Istio. Targets KOF 1.8.x as shipped with k0rdent Enterprise 1.3.2 (MKE 4.2.0).
+
+Set `kof_enabled=true` in `config` to auto-deploy KOF at the end of `t deploy lab`, or run `t deploy kof` against an already-running cluster. It **requires a StorageClass** — set `nfs_enabled=true` (or run `t deploy nfs`) first; the deploy resolves the cluster default StorageClass, falling back to `nfs-client`, and dies with an actionable message if neither exists.
+
+KOF installs as a **FluxCD-sequenced OCI umbrella Helm chart** (`oci://registry.mirantis.com/k0rdent-enterprise/charts/kof`) via **helm v3** (helm v4 has a webhook bug). The committed, version-pinned asset `kof/global-values.yaml` repoints every subchart image to `registry.mirantis.com/k0rdent-enterprise`; `kof_registry` is an override seam for a future airgap pass. The deploy is idempotent (`helm upgrade -i`).
+
+The umbrella and mothership charts default every k0rdent (KCM) namespace to `kcm-system`, but MKE4k's k0rdent Enterprise build runs k0rdent in the `k0rdent` namespace. `kof_kcm_namespace` (default `k0rdent`) repoints all of them — the umbrella Flux `HelmRepository`/`HelmChart` objects, the KCM integration, and the per-`ServiceTemplate` Flux repos created by mothership's pre-install hooks — and the preflight dies if that namespace is missing. Because this is self-monitoring only, the `kof-regional` and `kof-child` charts (regional/child cluster templates) are disabled.
+
+Before installing, `t deploy kof` exempts the `kof` namespace and the `opentelemetry-operator` service account from MKE4k's built-in `ucpauthz` admission policy (via `mkectl config get` → patch `spec.apiServer.ucpauthz` → `mkectl apply`). Without this, the OpenTelemetry operator is blocked from creating its collector DaemonSets, so node/host-log collection silently never starts. The step is idempotent — it merges into any existing exemptions and skips the (heavyweight) `mkectl apply` when `kof` is already exempt.
+
+**Grafana (opt-in):** Mirantis no longer ships Grafana with KOF. Set `kof_grafana_enabled=true` to have `t deploy kof` enable the `grafana-operator` + the mothership's datasources/dashboards/admin-secret, then apply a pinned Grafana instance CR (`kof/grafana.yaml`). The image is pinned to `<kof_registry>/grafana/grafana:<kof_grafana_image_tag>` (default tag `11.0.0` — the doc's `10.4.18-security-01` is not in the k0rdent-enterprise registry; use whatever tag your registry actually has). Access by port-forward: `kubectl -n kof port-forward svc/grafana-vm-service 3000:3000`; admin creds in secret `grafana-admin-credentials`.
+
+**Grafana over HTTPS (opt-in, touches terraform):** Set `kof_grafana_gateway_enabled=true` (requires `kof_grafana_enabled=true`) to expose Grafana via a dedicated Envoy **Gateway API** gateway instead of port-forward. `t deploy kof` then also runs `terraform apply` to add an NLB listener (`kof_grafana_lb_port`, default `8443`) + a security-group rule for a pinned Envoy NodePort (`kof_grafana_nodeport`, default `33002`), and applies `kof/grafana-gateway.yaml` (a self-contained `Issuer`/`Certificate`/`EnvoyProxy`/`Gateway`/`HTTPRoute` in the `kof` namespace, on the `mke-gateway-ingress` GatewayClass). TLS is self-signed (cert SANs = NLB DNS + node public IPs), terminated at the gateway; the NLB listener is plain TCP pass-through. Access: `https://<nlb-dns>:8443` (or `https://<node-public-ip>:33002`) — no `/etc/hosts` needed (dedicated listener, no host routing). dex/OIDC is not wired (Grafana's admin login is used).
+
+**Access (built-in VMUI, always available):**
+- Logs: `kubectl -n kof port-forward svc/kof-storage-victoria-logs-cluster-vlselect 9471:9471` → `http://localhost:9471/select/vmui/`
+- Metrics: `kubectl -n kof port-forward svc/vmselect-cluster 8481:8481` → `http://localhost:8481/select/0/vmui/`
+- Unified auth proxy: `svc/vmauth:8427` (basic-auth; the Grafana datasources point here)
+
 ### Tunnels (airgap)
 
 | Command | Description |
@@ -345,6 +371,21 @@ t destroy lab
 | `msr4_redis_operator_version` | `0.24.0` | OT-Container-Kit redis-operator chart version (HA only) |
 | `msr4_redis_replication_version` | `0.16.13` | OT-Container-Kit redis-replication chart version (HA only) |
 | `msr4_storage_size` | `10Gi` | PVC size for the MSR4 registry volume (requires `nfs_enabled=true`) |
+
+### KOF settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `kof_enabled` | `false` | Auto-deploy KOF (self-monitoring/M2M) at the end of `t deploy lab`. `t deploy kof` works standalone regardless. Requires a StorageClass |
+| `kof_version` | `1.8.1` | KOF Helm umbrella-chart version (matches k0rdent Enterprise 1.3.2 / MKE 4.2.0) |
+| `kof_storage_size` | `10Gi` | PVC size for the VictoriaMetrics / VictoriaLogs / VictoriaTraces volumes (doc default is 100Gi) |
+| `kof_registry` | `registry.mirantis.com/k0rdent-enterprise` | Image/chart registry. Override seam for future airgap; leave default for online |
+| `kof_kcm_namespace` | `k0rdent` | Namespace where k0rdent (KCM) runs. KOF's upstream default is `kcm-system`, but MKE4k's k0rdent Enterprise uses `k0rdent`; the KOF Flux objects + KCM integration are created here |
+| `kof_grafana_enabled` | `false` | Deploy Grafana (grafana-operator + datasources/dashboards + the `kof/grafana.yaml` instance CR). Grafana is no longer shipped with KOF by default |
+| `kof_grafana_image_tag` | `11.0.0` | Grafana image tag in `<kof_registry>/grafana/grafana` (the registry ships `11.0.0`, not the doc's `10.4.18-security-01`) |
+| `kof_grafana_gateway_enabled` | `false` | Expose Grafana over HTTPS via a dedicated Envoy Gateway + NLB listener (requires `kof_grafana_enabled`). **Touches terraform** — `t deploy kof` runs `terraform apply` |
+| `kof_grafana_nodeport` | `33002` | NodePort the Grafana Envoy gateway is pinned to (opened in the cluster SG; NLB target group forwards here). Range 32768-35535 |
+| `kof_grafana_lb_port` | `8443` | NLB listener port for Grafana (TCP pass-through; the gateway terminates TLS) |
 
 ## Airgap Architecture
 

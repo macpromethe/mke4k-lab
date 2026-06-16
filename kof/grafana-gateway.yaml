@@ -1,0 +1,105 @@
+# Dedicated Envoy Gateway exposing Grafana over HTTPS, for MKE4k (Gateway API +
+# Envoy Gateway, GatewayClass "mke-gateway-ingress"). Applied by 't deploy kof' when
+# kof_grafana_gateway_enabled=true, AFTER the Grafana instance exists.
+#
+# Why a dedicated gateway (not MKE's mke-gateway-ingress-* in the mke namespace):
+# those gateways use allowedRoutes.namespaces.from=Same, so a kof-namespace route
+# can't attach without a cross-namespace ReferenceGrant + their shared cert. A
+# dedicated gateway in kof keeps everything same-namespace and self-contained.
+#
+# 't deploy kof' substitutes before applying:
+#   - the EnvoyProxy NodePort  -> kof_grafana_nodeport (so terraform's NLB target
+#     group forwards to a known port; merged into the Envoy Service by port 443)
+#   - the Certificate SANs      -> NLB DNS + node public IPs (from terraform output)
+# TLS terminates here (self-signed); the NLB listener is plain TCP pass-through.
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: kof-grafana-selfsigned
+  namespace: kof
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kof-grafana
+  namespace: kof
+spec:
+  secretName: kof-grafana-tls
+  issuerRef:
+    name: kof-grafana-selfsigned
+    kind: Issuer
+  # dnsNames / ipAddresses are populated by 't deploy kof' from terraform output
+  # (NLB DNS + node public IPs). A placeholder keeps the CR valid standalone.
+  dnsNames:
+    - grafana.kof.local
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: kof-grafana-nodeport
+  namespace: kof
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: NodePort
+        # Pin the NodePort so the terraform NLB target group can target it, and
+        # force externalTrafficPolicy: Cluster. Envoy Gateway defaults NodePort
+        # services to `Local`, which only accepts traffic on the node running the
+        # Envoy pod. The NLB attaches controller IPs, but this pod has no
+        # control-plane toleration so it lands on a worker — with `Local` the
+        # controller NodePort refuses the health check. `Cluster` makes every
+        # node forward to the pod wherever it runs. (MKE's gateway does the same.)
+        # StrategicMerge merges Service.spec.ports by the `port` key.
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              externalTrafficPolicy: Cluster
+              ports:
+                - port: 443
+                  nodePort: 33002
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: kof-grafana
+  namespace: kof
+spec:
+  gatewayClassName: mke-gateway-ingress
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: kof-grafana-nodeport
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      allowedRoutes:
+        namespaces:
+          from: Same
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: kof-grafana-tls
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: kof-grafana
+  namespace: kof
+spec:
+  parentRefs:
+    - name: kof-grafana
+  # No hostnames: this dedicated listener serves only Grafana, so it matches any
+  # host — reach it by NLB DNS / node public IP without /etc/hosts.
+  rules:
+    - backendRefs:
+        - name: grafana-vm-service
+          port: 3000

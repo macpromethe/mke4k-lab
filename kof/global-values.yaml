@@ -1,0 +1,145 @@
+global:
+  registry: registry.mirantis.com/k0rdent-enterprise
+  imageRegistry: registry.mirantis.com/k0rdent-enterprise
+  image:
+    registry: registry.mirantis.com/k0rdent-enterprise
+  hub: registry.mirantis.com/k0rdent-enterprise/istio
+  helmChartsRepo: oci://registry.mirantis.com/k0rdent-enterprise/charts
+  helmRepo:
+    kofManaged:
+      url: oci://registry.mirantis.com/k0rdent-enterprise/charts
+cert-manager-istio-csr:
+  image:
+    repository: registry.mirantis.com/k0rdent-enterprise/jetstack/cert-manager-istio-csr
+cert-manager-service-template:
+  skipVerifyJob: true
+  repo:
+    spec:
+      type: oci
+      url: oci://registry.mirantis.com/k0rdent-enterprise/charts
+external-dns:
+  image:
+    repository: registry.mirantis.com/k0rdent-enterprise/external-dns/external-dns
+envoy-gateway-service-template:
+  skipVerifyJob: true
+  repo:
+    spec:
+      type: oci
+      url: oci://registry.mirantis.com/k0rdent-enterprise/charts
+envoy-gateway:
+  values:
+    config:
+      envoyGateway:
+        envoyProxy:
+          provider:
+            type: Kubernetes
+            kubernetes:
+              envoyDeployment:
+                container:
+                  image: registry.mirantis.com/k0rdent-enterprise/envoyproxy/envoy:distroless-v1.37.1
+ingress-nginx-service-template:
+  skipVerifyJob: true
+  repo:
+    spec:
+      type: oci
+      url: oci://registry.mirantis.com/k0rdent-enterprise/charts
+kcm:
+  kof:
+    acl:
+      image:
+        registry: registry.mirantis.com/k0rdent-enterprise
+    operator:
+      image:
+        registry: registry.mirantis.com/k0rdent-enterprise
+
+k0rdent-istio:
+  repo:
+    spec:
+      url: oci://registry.mirantis.com/k0rdent-enterprise/charts
+istio:
+  repo:
+    spec:
+      type: oci
+      url: oci://registry.mirantis.com/k0rdent-enterprise/charts
+opencost:
+  opencost:
+    exporter:
+      image:
+        registry: registry.mirantis.com/k0rdent-enterprise
+    ui:
+      image:
+        registry: registry.mirantis.com/k0rdent-enterprise
+opentelemetry-operator:
+  manager:
+    image:
+      repository: registry.mirantis.com/k0rdent-enterprise/opentelemetry-operator/opentelemetry-operator
+    collectorImage:
+      repository: registry.mirantis.com/k0rdent-enterprise/otel/opentelemetry-collector-contrib
+  kubeRBACProxy:
+    image:
+      repository: registry.mirantis.com/k0rdent-enterprise/brancz/kube-rbac-proxy
+opentelemetry-kube-stack:
+  collectors:
+    daemon:
+      image:
+        repository: registry.mirantis.com/k0rdent-enterprise/kof/kof-opentelemetry-collector-contrib
+    target-allocator:
+      targetAllocator:
+        image: registry.mirantis.com/k0rdent-enterprise/opentelemetry-operator/target-allocator:v0.143.0
+  kube-state-metrics:
+    initContainers:
+      - command:
+          - /bin/sh
+          - -c
+          - |
+            cat << EOF > "/etc/config/crd-metrics-config.yaml"
+            kind: CustomResourceStateMetrics
+            spec:
+              resources: []
+            EOF
+        image: registry.mirantis.com/k0rdent-enterprise/kiwigrid/k8s-sidecar:2.1.4
+        name: init-crd-config
+        volumeMounts:
+          - mountPath: /etc/config
+            name: config-volume
+    containers:
+      - env:
+          - name: HEALTH_PORT
+            value: "8088"
+          - name: LABEL
+            value: kube-state-metrics/custom-resource
+          - name: FOLDER
+            value: /tmp
+          - name: RESOURCE
+            value: configmap
+          - name: NAMESPACE
+            value: kof
+          - name: SCRIPT
+            value: /script/compile.sh
+        image: registry.mirantis.com/k0rdent-enterprise/kiwigrid/k8s-sidecar:2.1.4
+        name: crd-sidecar
+        volumeMounts:
+          - mountPath: /etc/config
+            name: config-volume
+          - mountPath: /script
+            name: compile-script
+victoria-metrics-operator:
+  repo:
+    type: oci
+    url: oci://registry.mirantis.com/k0rdent-enterprise/charts
+vlogxy:
+  image:
+    registry: registry.mirantis.com/k0rdent-enterprise
+  config-reloader:
+    image: registry.mirantis.com/k0rdent-enterprise/jimmidyson/configmap-reload:v0.15.0
+cert-manager:
+  cluster-issuer:
+    provider: self-signed
+storage:
+  cert-manager:
+    cluster-issuer:
+      provider: self-signed
+      name: selfsigned
+  gateway:
+    annotations:
+      cert-manager.io/cluster-issuer: selfsigned
