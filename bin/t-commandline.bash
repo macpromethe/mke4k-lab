@@ -3159,7 +3159,14 @@ cmd_deploy_kof() {
             echo -e "    Grafana:        kubectl -n kof port-forward svc/grafana-vm-service 3000:3000"
             echo -e "                    then open http://localhost:3000  (dashboards + metrics/logs/traces datasources)"
         fi
-        echo -e "    Grafana creds:  kubectl get secret -n kof grafana-admin-credentials -o yaml | yq '{\"user\": .data.GF_SECURITY_ADMIN_USER | @base64d, \"pass\": .data.GF_SECURITY_ADMIN_PASSWORD | @base64d}'"
+        local _gf_user _gf_pass
+        _gf_user="$(kubectl get secret -n kof grafana-admin-credentials -o jsonpath='{.data.GF_SECURITY_ADMIN_USER}' 2>/dev/null | base64 -d 2>/dev/null)"
+        _gf_pass="$(kubectl get secret -n kof grafana-admin-credentials -o jsonpath='{.data.GF_SECURITY_ADMIN_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null)"
+        if [[ -n "${_gf_user}" && -n "${_gf_pass}" ]]; then
+            echo -e "    Grafana login:  ${BOLD}${_gf_user}${RESET} / ${BOLD}${_gf_pass}${RESET}"
+        else
+            echo -e "    Grafana creds:  kubectl get secret -n kof grafana-admin-credentials -o yaml | yq '{\"user\": .data.GF_SECURITY_ADMIN_USER | @base64d, \"pass\": .data.GF_SECURITY_ADMIN_PASSWORD | @base64d}'"
+        fi
     else
         echo -e "    Grafana:        not deployed (set kof_grafana_enabled=true). Built-in VMUI below:"
     fi
