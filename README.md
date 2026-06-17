@@ -185,7 +185,7 @@ The umbrella and mothership charts default every k0rdent (KCM) namespace to `kcm
 
 Before installing, `t deploy kof` exempts the `kof` namespace and the `opentelemetry-operator` service account from MKE4k's built-in `ucpauthz` admission policy (via `mkectl config get` → patch `spec.apiServer.ucpauthz` → `mkectl apply`). Without this, the OpenTelemetry operator is blocked from creating its collector DaemonSets, so node/host-log collection silently never starts. The step is idempotent — it merges into any existing exemptions and skips the (heavyweight) `mkectl apply` when `kof` is already exempt.
 
-**Grafana (opt-in):** Mirantis no longer ships Grafana with KOF. Set `kof_grafana_enabled=true` to have `t deploy kof` enable the `grafana-operator` + the mothership's datasources/dashboards/admin-secret, then apply a pinned Grafana instance CR (`kof/grafana.yaml`). The image is pinned to `<kof_registry>/grafana/grafana:<kof_grafana_image_tag>` (default tag `11.0.0` — the doc's `10.4.18-security-01` is not in the k0rdent-enterprise registry; use whatever tag your registry actually has). Access by port-forward: `kubectl -n kof port-forward svc/grafana-vm-service 3000:3000`; admin creds in secret `grafana-admin-credentials`.
+**Grafana (opt-in):** Mirantis no longer ships Grafana with KOF. Set `kof_grafana_enabled=true` to have `t deploy kof` enable the `grafana-operator` + the mothership's datasources/dashboards/admin-secret, then apply a pinned Grafana instance CR (`kof/grafana.yaml`). The image is pinned to `<kof_registry>/grafana/grafana:<kof_grafana_image_tag>` (default tag `11.0.0` — the doc's `10.4.18-security-01` is not in the k0rdent-enterprise registry; use whatever tag your registry actually has). Access by port-forward: `kubectl -n kof port-forward svc/grafana-vm-service 3000:3000`. The admin login (from secret `grafana-admin-credentials`) is resolved and printed in the deploy output (`Grafana login: <user> / <pass>`).
 
 **Grafana over HTTPS (opt-in, touches terraform):** Set `kof_grafana_gateway_enabled=true` (requires `kof_grafana_enabled=true`) to expose Grafana via a dedicated Envoy **Gateway API** gateway instead of port-forward. `t deploy kof` then also runs `terraform apply` to add an NLB listener (`kof_grafana_lb_port`, default `8443`) + a security-group rule for a pinned Envoy NodePort (`kof_grafana_nodeport`, default `33002`), and applies `kof/grafana-gateway.yaml` (a self-contained `Issuer`/`Certificate`/`EnvoyProxy`/`Gateway`/`HTTPRoute` in the `kof` namespace, on the `mke-gateway-ingress` GatewayClass). TLS is self-signed (cert SANs = NLB DNS + node public IPs), terminated at the gateway; the NLB listener is plain TCP pass-through. Access: `https://<nlb-dns>:8443` (or `https://<node-public-ip>:33002`) — no `/etc/hosts` needed (dedicated listener, no host routing). dex/OIDC is not wired (Grafana's admin login is used).
 
@@ -193,6 +193,35 @@ Before installing, `t deploy kof` exempts the `kof` namespace and the `opentelem
 - Logs: `kubectl -n kof port-forward svc/kof-storage-victoria-logs-cluster-vlselect 9471:9471` → `http://localhost:9471/select/vmui/`
 - Metrics: `kubectl -n kof port-forward svc/vmselect-cluster 8481:8481` → `http://localhost:8481/select/0/vmui/`
 - Unified auth proxy: `svc/vmauth:8427` (basic-auth; the Grafana datasources point here)
+
+**Example — deploy KOF with Grafana over HTTPS on a running lab:**
+
+```bash
+# 1. Ensure a StorageClass exists (KOF's PVCs need one). nfs_enabled=true in
+#    config provisions it during 't deploy lab'; otherwise add it on demand:
+t deploy nfs
+
+# 2. Turn on KOF + Grafana + the HTTPS gateway in config:
+#      kof_enabled=true              # (optional) also auto-runs at end of 't deploy lab'
+#      kof_grafana_enabled=true
+#      kof_grafana_gateway_enabled=true
+vi config
+
+# 3. Deploy KOF on the existing cluster. Because the gateway is enabled this
+#    also runs 'terraform apply' to add the NLB listener + SG rule (idempotent).
+t deploy kof
+
+# The deploy output ends with the access block, e.g.:
+#   KOF access (self-monitoring / M2M):
+#     Grafana (HTTPS): https://<nlb-dns>:8443  (self-signed; accept the cert)
+#                      or https://<node-public-ip>:33002
+#     Grafana login:  admin / <generated-password>
+
+# 4. Tear down just KOF when done (leaves the cluster intact):
+t destroy kof
+```
+
+> With `kof_enabled=true`, step 3 runs automatically at the end of `t deploy lab` — no separate `t deploy kof` needed.
 
 ### Tunnels (airgap)
 
@@ -357,7 +386,7 @@ t destroy lab
 |---|---|---|
 | `nfs_enabled` | `false` | Provisions NFS server EC2, installs nfs-common on nodes, deploys nfs-subdir-external-provisioner |
 | `nfs_flavor` | `t3.small` | EC2 instance type for the NFS server |
-| `nfs_disk_gb` | `50` | Root volume size (GB) for the NFS server |
+| `nfs_disk_gb` | `150` | Root volume size (GB) for the NFS server. Sized with headroom for KOF's VictoriaMetrics/Logs/Traces PVCs, which land on `nfs-client` |
 | `nfs_export_path` | `/srv/nfs/data` | NFS export path on the server |
 
 ### MSR4 settings
