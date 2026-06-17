@@ -101,7 +101,7 @@ nfs_enabled=true
 nfs_flavor="t3.small"
 
 # Root volume size in GB for the NFS server.
-nfs_disk_gb=50
+nfs_disk_gb=150
 
 # NFS export path on the server.
 nfs_export_path="/srv/nfs/data"

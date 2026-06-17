@@ -112,7 +112,7 @@ load_config() {
     # NFS defaults
     nfs_enabled="${nfs_enabled:-false}"
     nfs_flavor="${nfs_flavor:-t3.small}"
-    nfs_disk_gb="${nfs_disk_gb:-50}"
+    nfs_disk_gb="${nfs_disk_gb:-150}"
     nfs_export_path="${nfs_export_path:-/srv/nfs/data}"
 
     # MSR4 defaults
