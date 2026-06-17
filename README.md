@@ -6,29 +6,55 @@ Terraform provisions a dedicated VPC, EC2 instances, NLB, and IAM role; `mkectl 
 
 ## Quick Start
 
-### Option A — Docker (recommended)
+### Option A — Prebuilt Docker image (easiest)
+
+The latest image is always published to `registry.ci.mirantis.com/ajagiello/mke4k-lab:latest`, so you can skip the build entirely:
+
+```bash
+# Pull the prebuilt image
+docker pull registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
+
+# First run — name the container so you can re-attach later
+docker run -it --name mke4k-lab registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
+
+# For airgap deployments, add port mappings for UI tunnels
+#   3000 = MKE4k/MKE3 Dashboard, 8444 = MSR4 (Harbor) UI
+docker run -it --name mke4k-lab \
+  -p 3000:3000 -p 8444:8444 \
+  registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
+```
+
+> **AWS credentials** — you don't have to pass them at `docker run` time. Once inside the container just export them in the shell:
+> ```bash
+> export AWS_ACCESS_KEY_ID="..."
+> export AWS_SECRET_ACCESS_KEY="..."
+> ```
+> If you'd rather inject them up front, add `-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY` to the `docker run` command (passes them through from your host env).
+
+> The bastion's Harbor registry UI is reachable directly at `https://<bastion-public-ip>` (the bastion has a public IP and the SG opens 443), so no port mapping or tunnel is needed for it.
+
+### Option B — Build the Docker image yourself
 
 ```bash
 # Build the image (terraform providers pre-initialised during build)
 docker build -t mke4k-lab .
 
 # First run — name the container so you can re-attach later
-docker run -it --name mke4k-lab \
-  -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
-  -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
-  mke4k-lab
+docker run -it --name mke4k-lab mke4k-lab
 
 # For airgap deployments, add port mappings for UI tunnels
-#   3000 = MKE4k/MKE3 Dashboard, 8443 = Harbor registry UI, 8444 = MSR4 (Harbor) UI
+#   3000 = MKE4k/MKE3 Dashboard, 8444 = MSR4 (Harbor) UI
 docker run -it --name mke4k-lab \
-  -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
-  -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
-  -p 3000:3000 -p 8443:8443 -p 8444:8444 \
+  -p 3000:3000 -p 8444:8444 \
   mke4k-lab
 ```
 
+As with Option A, export `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` inside the container (or pass `-e` at `docker run` time).
+
 Once inside the container:
 ```bash
+export AWS_ACCESS_KEY_ID="..."        # if not already passed via -e on docker run
+export AWS_SECRET_ACCESS_KEY="..."
 vi /mke4k-lab/config      # edit cluster settings
 t deploy lab              # MKE4k: provision EC2 + NLB, then install
 t deploy lab mke3         # MKE3:  provision + launchpad apply
@@ -49,7 +75,7 @@ docker cp mke4k-lab:/mke4k-lab/terraform/aws_private.pem .
 docker cp mke4k-lab:/mke4k-lab/terraform/terraform.tfstate .
 ```
 
-### Option B — Local (requires tools installed)
+### Option C — Local (requires tools installed)
 
 #### Prerequisites
 
@@ -92,6 +118,133 @@ This will:
 1. Run `terraform init` + `terraform apply` (provisions dedicated VPC + EC2 + NLB + IAM)
 2. Generate `terraform/mke4.yaml` from the provisioned infrastructure
 3. Run `mkectl apply -f terraform/mke4.yaml`
+
+## Recipes
+
+Each recipe is just **(1) a handful of edits in `config`** + **(2) one command**. All of them assume you're already inside the container (`docker start -ai mke4k-lab`) with AWS credentials exported. Only the lines that differ from the shipped `config` are shown.
+
+### Deploy MKE4k v4.1.5 (online)
+
+```bash
+# config
+mke4k_version="v4.1.5"
+ccm_enabled=true          # enable for LoadBalancer services / EBS volumes
+```
+
+```bash
+t deploy lab
+```
+
+### Deploy MKE4k v4.1.5 — HA control plane (3 controllers)
+
+```bash
+# config
+mke4k_version="v4.1.5"
+controller_count=3        # must be odd
+worker_count=2
+ccm_enabled=true
+```
+
+```bash
+t deploy lab
+```
+
+### Deploy MKE4k v4.1.5 airgap
+
+Cluster nodes sit in a private subnet with no internet; a bastion runs Harbor and the bundle is mirrored locally. CCM is auto-disabled (no AWS API from the private subnet).
+
+```bash
+# config
+mke4k_version="v4.1.5"
+airgap_registry_disk_gb=100      # holds Harbor + the mirrored bundle
+```
+
+```bash
+t deploy lab airgap
+```
+
+> Airgap bundles only exist for GA versions. If `v4.1.5` has no published bundle, either pick a GA version or set `mke4k_bundle_url=` to a reachable bundle.
+
+### Deploy MSR4 (Harbor) on a running MKE4k v4.1.5 cluster
+
+MSR4 needs a StorageClass, so deploy with NFS first, then add MSR4.
+
+```bash
+# config
+mke4k_version="v4.1.5"
+nfs_enabled=true          # provides the nfs-client StorageClass MSR4 needs
+msr4_enabled=true
+msr4_replicas=1           # simple mode: built-in DB + Redis
+```
+
+```bash
+t deploy lab              # cluster + NFS StorageClass
+t deploy msr4             # then MSR4 on top
+```
+
+Access: `https://msr.<cluster>.local:33443` (add the node public IP to `/etc/hosts`) or `https://<node-public-dns>:33443`. Admin password is written to `terraform/msr4_credentials.txt`.
+
+### Deploy HA MSR4 (postgres-operator + redis-operator)
+
+HA schedules replicas only on workers (controllers are tainted), so you need `worker_count >= msr4_replicas`.
+
+```bash
+# config
+mke4k_version="v4.1.5"
+worker_count=2            # must be >= msr4_replicas
+nfs_enabled=true
+msr4_enabled=true
+msr4_replicas=2           # HA mode: external postgres + redis operators
+```
+
+```bash
+t deploy lab
+t deploy msr4
+```
+
+### Deploy MSR4 on an airgap MKE4k cluster
+
+```bash
+# config
+mke4k_version="v4.1.5"
+nfs_enabled=true
+msr4_enabled=true
+```
+
+```bash
+t deploy lab airgap
+t deploy msr4 airgap      # images/charts mirrored to the bastion Harbor
+t tunnel msr4             # then browse https://localhost:8444  (needs -p 8444:8444)
+```
+
+### Deploy KOF observability (with Grafana over HTTPS)
+
+```bash
+# config
+mke4k_version="v4.1.5"
+nfs_enabled=true                   # KOF's VictoriaMetrics/Logs/Traces PVCs need a StorageClass
+kof_enabled=true                   # auto-runs at the end of 't deploy lab'
+kof_grafana_enabled=true
+kof_grafana_gateway_enabled=true   # exposes Grafana via NLB listener (runs terraform apply)
+```
+
+```bash
+t deploy lab
+# Grafana: https://<nlb-dns>:8443  (login printed in the deploy summary)
+```
+
+### Deploy MKE3 v3.8.2, then test the in-place upgrade to MKE4k
+
+```bash
+# config
+mke3_version="3.8.2"
+mke4k_version="v4.1.5"    # the upgrade target
+```
+
+```bash
+t deploy lab mke3         # provisions both NLBs + launchpad apply
+# the deploy summary prints a ready-to-paste mkectl upgrade command
+```
 
 ## CLI Commands
 
@@ -230,7 +383,7 @@ t destroy kof
 | `t tunnel` | Show available SSH tunnels with manual commands |
 | `t tunnel dashboard` | MKE4k Dashboard tunnel -> https://localhost:3000 |
 | `t tunnel mke3` | MKE3 Dashboard tunnel -> https://localhost:3000 |
-| `t tunnel registry` | Harbor Registry tunnel -> https://localhost:8443 |
+| `t tunnel registry` | Harbor Registry tunnel -> https://localhost:8443 (optional; the bastion's Harbor is also reachable directly at `https://<bastion-public-ip>`) |
 | `t tunnel msr4` | MSR4 Harbor UI tunnel -> https://localhost:8444 |
 
 ### General
@@ -327,7 +480,10 @@ t tunnel dashboard
 t tunnel mke3
 # then browse https://localhost:3000
 
-# Airgap: access Harbor UI (requires -p 8443:8443 on docker run)
+# Airgap: access Harbor UI — the bastion has a public IP and the SG opens 443,
+# so browse it directly (no tunnel/port mapping needed):
+#   https://<bastion-public-ip>      (see `t show nodes` for the IP)
+# Or, if you prefer a tunnel (requires -p 8443:8443 on docker run):
 t tunnel registry
 # then browse https://localhost:8443
 
