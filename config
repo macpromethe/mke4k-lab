@@ -1,118 +1,50 @@
 # ============================================================
 #  mke4k-lab -- cluster configuration
 #  Edit this file, then run:  t deploy lab
+#
+#  1. Basic setup       -- what you usually change
+#  2. Airgap settings   -- only for airgapped deployments
+#  3. Advanced settings -- fine-tuning; defaults are sensible
 # ============================================================
 
-# -- Cluster identity ----------------------------------------
-# Name prefix used for all AWS resources (EC2, SG, NLB, IAM).
-# Keep it short, lowercase, no spaces.
-# Leave as "mke4k-lab" for auto-generated unique suffix (e.g. mke4k-lab-a3f2).
+# ============================================================
+#  1. Basic setup
+# ============================================================
+
+# Name prefix for all AWS resources. Leave as "mke4k-lab" to get a unique
+# random suffix (e.g. mke4k-lab-a3f2).
 cluster_name="mke4k-lab"
 
-# -- Node counts ---------------------------------------------
-# For HA control plane use 3 controllers (must be an odd number).
-# Workers run your workloads.
+# AWS region to deploy into. Must match your credentials' scope.
+region="eu-central-1"
+
+# Control plane: use 3 for HA (must be odd). Workers run your workloads.
 controller_count=1
 worker_count=1
 
-# -- Instance sizing -----------------------------------------
-# All nodes use the same EC2 instance type.
-# Minimum recommended: m5.xlarge (4 vCPU / 16 GB RAM).
-cluster_flavor="m5.xlarge"
-
-# -- AWS region ----------------------------------------------
-# Region to deploy into. Must match your credentials scope.
-region="eu-central-1"
-
-# -- Operating system ----------------------------------------
-# Ubuntu version for all EC2 nodes.
-# Supported values: ubuntu-22.04  |  ubuntu-24.04
-os_distro="ubuntu-22.04"
-
-# -- AWS Cloud Controller Manager (CCM) ----------------------
-# true  -> IAM role + policy created; CCM enabled in mke4.yaml.
-#          Required for LoadBalancer services and EBS volumes.
-# false -> no IAM resources; cloudProvider disabled in mke4.yaml.
-ccm_enabled=false
-
-# -- Debug mode ----------------------------------------------
-# true -> mkectl runs with -l debug (very verbose output).
-debug=true
-
-# ============================================================
-#  MKE4k settings  (t deploy lab / t deploy lab mke4)
-# ============================================================
-# mkectl is downloaded automatically at this version on first use.
+# -- MKE4k --
+# mkectl is auto-downloaded at this version.
 # Releases: https://github.com/MirantisContainers/mke-release/releases
 mke4k_version="v4.1.5"
 
-# ============================================================
-#  MKE3 settings   (t deploy lab mke3)
-# ============================================================
-# launchpad binary is downloaded automatically on first use.
-# Releases: https://github.com/Mirantis/launchpad/releases
-launchpad_version="1.5.15"
+# k0rdent UI (t deploy k0rdent-ui / t destroy k0rdent-ui)
+# true  -> UI will be available
+# false -> run 't deploy k0rdent-ui' once the cluster is already deployed
+k0rdent_ui_enabled=false
 
+# -- MKE3 (t deploy lab mke3) --
 mke3_version="3.8.2"
 mcr_version="25.0.14"
 # NOTE: As of launchpad 1.5.15, channel must match mcr_version exactly.
 # Pattern: stable-<major>.<minor>.<patch>  e.g. stable-25.0.14 for mcr_version 25.0.14
 mcr_channel="stable-25.0.14"
 
-# Admin username for the MKE3 UI.
-# The password is auto-generated on first deploy and saved to
-# terraform/mke3_credentials.txt - printed in the deploy summary.
-mke3_admin_username="admin"
-
-# ============================================================
-#  Airgap settings  (t deploy lab airgap)
-# ============================================================
-# Instance type for the bastion/registry host.
-# Needs enough CPU/RAM for Harbor + skopeo image uploads.
-airgap_registry_flavor="t3.xlarge"
-
-# Root volume size in GB for the bastion/registry host.
-# Must be large enough for Harbor data + MKE4k bundle images (~15-20 GB).
-airgap_registry_disk_gb=100
-
-# MSR4 (Harbor) offline installer version.
-# Releases: https://s3-us-east-2.amazonaws.com/packages-mirantis.com/msr/
-airgap_msr_version="v4.13.3"
-
-# Override the MKE4k bundle download URL.
-# Default: https://packages.mirantis.com/caas/mke_bundle_<version>_amd64.tar.gz
-# NOTE: Airgap bundles are only available for GA versions (e.g. v4.1.1, v4.1.2, v4.1.3).
-#       RC/dev versions only support online install.
-# mke4k_bundle_url=""
-
-# Override the MKE3 image bundle download URL.
-# Default: https://packages.mirantis.com/caas/ucp_images_<mke3_version>.tar.gz
-# mke3_bundle_url=""
-
-# ============================================================
-#  NFS settings   (optional - works with all deploy modes)
-# ============================================================
-# true  -> provisions a dedicated NFS server EC2, installs nfs-common on
-#          all cluster nodes, and deploys the nfs-subdir-external-provisioner + default StorageClass.
-# false -> no NFS resources created (default).
+# -- NFS storage (works with all deploy modes) --
+# true -> NFS server + 'nfs-client' default StorageClass.
 nfs_enabled=true
 
-# EC2 instance type for the NFS server.
-nfs_flavor="t3.small"
-
-# Root volume size in GB for the NFS server.
-nfs_disk_gb=150
-
-# NFS export path on the server.
-nfs_export_path="/srv/nfs/data"
-
-# ============================================================
-#  MSR4 settings   (t deploy msr4 / t deploy msr4 airgap)
-# ============================================================
-# true  -> enables MSR4 (Harbor) deployment on the running MKE4k cluster.
-#          Run 't deploy msr4' (or 't deploy msr4 airgap') after the cluster
-#          and NFS StorageClass are up. Does NOT auto-run during 't deploy lab'.
-# false -> MSR4 commands refuse to run (default).
+# -- MSR4 / Harbor (t deploy msr4) --
+# true -> enable MSR4 deployment on the running cluster.
 msr4_enabled=false
 
 # Harbor chart version deployed on the cluster.
@@ -124,58 +56,88 @@ msr4_version="4.13.3"
 #   2+   -> HA mode: external postgres-operator + redis-operator (requires NFS StorageClass)
 msr4_replicas=1
 
-# Component versions used in HA mode (msr4_replicas >= 2).
+# -- KOF observability (t deploy kof) --
+# WARNING: requires MKE 4.2.0+ (k0rdent Enterprise 1.3.2). Keep false on MKE < 4.2.0.
+kof_enabled=false
+kof_grafana_enabled=false
+kof_grafana_gateway_enabled=false
+
+# ============================================================
+#  2. Airgap settings   (only for 't deploy lab airgap' / 'mke3-airgap')
+# ============================================================
+
+# Bastion/registry host: needs CPU/RAM for Harbor + skopeo image uploads.
+airgap_registry_flavor="t3.xlarge"
+
+# Bastion root volume (GB): holds Harbor data + the MKE4k bundle (~15-20 GB).
+airgap_registry_disk_gb=100
+
+# MSR4 (Harbor) offline installer version for the bastion registry.
+# Releases: https://s3-us-east-2.amazonaws.com/packages-mirantis.com/msr/
+airgap_msr_version="v4.13.3"
+
+# Override the bundle download URLs (defaults derive from the versions above).
+# NOTE: airgap bundles exist only for GA versions (e.g. v4.1.1/2/3); RC/dev = online only.
+# mke4k_bundle_url=""
+# mke3_bundle_url=""
+
+# ============================================================
+#  3. Advanced settings   (defaults are sensible; change only if needed)
+# ============================================================
+
+# -- Instances --
+# EC2 instance type for all nodes. Minimum recommended: m5.xlarge (4 vCPU / 16 GB).
+cluster_flavor="m5.xlarge"
+
+# Ubuntu version for all nodes: ubuntu-22.04 | ubuntu-24.04
+os_distro="ubuntu-22.04"
+
+# AWS Cloud Controller Manager.
+# true  -> IAM role + policy; required for LoadBalancer services and EBS volumes.
+# false -> no IAM resources; cloudProvider disabled.
+ccm_enabled=false
+
+# true -> mkectl runs with -l debug (very verbose).
+debug=true
+
+# -- k0rdent UI gateway (used when k0rdent_ui_enabled=true) --
+# NodePort the Envoy gateway is pinned to (MKE4k range 32768-35535; 33001/33002/33443 taken).
+k0rdent_ui_nodeport=33003
+# NLB listener port. Online: https://<nlb-dns>:<lb_port>. Airgap: t tunnel k0rdent-ui.
+k0rdent_ui_lb_port=8445
+
+# -- MKE3 --
+# launchpad binary is auto-downloaded on first use.
+# Releases: https://github.com/Mirantis/launchpad/releases
+launchpad_version="1.5.15"
+
+# Admin username for the MKE3 UI (password auto-generated -> terraform/mke3_credentials.txt).
+mke3_admin_username="admin"
+
+# -- NFS server --
+nfs_flavor="t3.small"
+nfs_disk_gb=150
+nfs_export_path="/srv/nfs/data"
+
+# -- MSR4 HA (used when msr4_replicas >= 2) --
 msr4_postgres_version="1.15.1"
 msr4_redis_operator_version="0.24.0"
 msr4_redis_replication_version="0.16.13"
-
 # PVC size for the MSR4 registry volume. Requires nfs_enabled=true.
 msr4_storage_size="10Gi"
 
-# ============================================================
-#  KOF settings   (t deploy kof / t destroy kof)
-# ============================================================
-# KOF = k0rdent Observability & FinOps. Online self-monitoring (M2M) mode:
-# the cluster stores its own metrics/logs/traces locally. Requires a
-# StorageClass (set nfs_enabled=true or run 't deploy nfs' first).
-# true  -> auto-deploy KOF at the end of 't deploy lab'.
-# false -> KOF never runs automatically (default). 't deploy kof' still works manually.
-kof_enabled=false
-
-# KOF Helm umbrella-chart version (matches k0rdent Enterprise 1.3.2 / MKE 4.2.0).
+# -- KOF (used when kof_enabled=true) --
+# Helm umbrella-chart version (matches k0rdent Enterprise 1.3.2 / MKE 4.2.0).
 kof_version="1.8.1"
-
-# PVC size for the VictoriaMetrics / VictoriaLogs / VictoriaTraces storage volumes.
-# Doc default is 100Gi; keep small for lab use.
+# PVC size for VictoriaMetrics / VictoriaLogs / VictoriaTraces (doc default 100Gi).
 kof_storage_size="10Gi"
-
-# Image/chart registry. Override seam for future airgap; leave default for online.
+# Image/chart registry. Override for airgap; leave default for online.
 kof_registry="registry.mirantis.com/k0rdent-enterprise"
-
-# Deploy Grafana for KOF (Mirantis no longer ships it by default). When true,
-# 't deploy kof' enables the grafana-operator + datasources/dashboards and applies
-# a Grafana instance CR (kof/grafana.yaml). Access via port-forward (see deploy output).
-kof_grafana_enabled=false
-
-# Grafana image tag in <kof_registry>/grafana/grafana. The KOF 1.8.1 doc references
-# 10.4.18-security-01, but the k0rdent-enterprise registry ships 11.0.0 — use what
-# your registry actually has (Harbor: Projects > k0rdent-enterprise > grafana/grafana).
+# Grafana image tag in <kof_registry>/grafana/grafana (registry ships 11.0.0).
 kof_grafana_image_tag="11.0.0"
-
-# Expose Grafana over HTTPS via a dedicated Envoy Gateway + NLB listener (instead of
-# only port-forward). Requires kof_grafana_enabled=true. This adds an NLB listener +
-# a pinned NodePort + a security-group rule, so it TOUCHES TERRAFORM — enabling it
-# means 't deploy kof' will run 'terraform apply'. Access: https://<nlb-dns>:<lb_port>.
-kof_grafana_gateway_enabled=false
-
-# NodePort the dedicated Grafana Envoy gateway is pinned to (opened in the cluster SG;
-# the NLB target group forwards to it). Must be in the MKE4k NodePort range 32768-35535.
+# Grafana gateway NodePort (MKE4k range 32768-35535).
 kof_grafana_nodeport=33002
-
-# NLB listener port for Grafana (TCP pass-through to the gateway, which terminates TLS).
+# NLB listener port for Grafana (TCP pass-through; gateway terminates TLS).
 kof_grafana_lb_port=8443
-
-# Namespace where k0rdent (KCM) runs on this cluster. KOF's upstream default is
-# "kcm-system", but MKE4k's k0rdent Enterprise build uses "k0rdent". The KOF Flux
-# HelmRepository/HelmChart objects and the KCM integration are created here.
+# Namespace where k0rdent (KCM) runs (MKE4k uses "k0rdent", upstream default "kcm-system").
 kof_kcm_namespace="k0rdent"

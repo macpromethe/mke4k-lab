@@ -135,6 +135,11 @@ load_config() {
     kof_grafana_gateway_enabled="${kof_grafana_gateway_enabled:-false}"
     kof_grafana_nodeport="${kof_grafana_nodeport:-33002}"
     kof_grafana_lb_port="${kof_grafana_lb_port:-8443}"
+
+    # k0rdent UI defaults
+    k0rdent_ui_enabled="${k0rdent_ui_enabled:-false}"
+    k0rdent_ui_nodeport="${k0rdent_ui_nodeport:-33003}"
+    k0rdent_ui_lb_port="${k0rdent_ui_lb_port:-8445}"
 }
 
 msr4_credentials_file() {
@@ -184,6 +189,9 @@ nfs_disk_gb              = ${nfs_disk_gb}
 kof_grafana_gateway_enabled = ${kof_grafana_gateway_enabled:-false}
 kof_grafana_nodeport     = ${kof_grafana_nodeport:-33002}
 kof_grafana_lb_port      = ${kof_grafana_lb_port:-8443}
+k0rdent_ui_enabled       = ${k0rdent_ui_enabled:-false}
+k0rdent_ui_nodeport      = ${k0rdent_ui_nodeport:-33003}
+k0rdent_ui_lb_port       = ${k0rdent_ui_lb_port:-8445}
 EOF
     info "Wrote terraform/terraform.tfvars"
 }
@@ -2573,6 +2581,9 @@ cmd_deploy_lab_mke4() {
     if [[ "${kof_enabled}" == "true" ]]; then
         cmd_deploy_kof
     fi
+    if [[ "${k0rdent_ui_enabled}" == "true" ]]; then
+        cmd_deploy_k0rdent_ui
+    fi
     print_deploy_summary
     export KUBECONFIG=/root/.mke/mke.kubeconf
 }
@@ -2681,6 +2692,10 @@ cmd_deploy_lab_airgap() {
     if [[ "${nfs_enabled}" == "true" ]]; then
         deploy_nfs_provisioner_airgap
         timer_phase_end _T_NFS
+    fi
+
+    if [[ "${k0rdent_ui_enabled}" == "true" ]]; then
+        cmd_deploy_k0rdent_ui
     fi
 
     print_airgap_deploy_summary
@@ -3186,6 +3201,219 @@ cmd_destroy_kof() {
     kubectl delete ns kof --wait=false || true
     warn "If namespace 'kof' hangs in Terminating, PVCs/finalizers may need manual cleanup."
     success "KOF removed."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# k0rdent Enterprise UI — rotate password + publish via Envoy gateway
+# ---------------------------------------------------------------------------
+# MKE4k installs the k0rdent UI (service kcm-k0rdent-ui:3000 in namespace k0rdent)
+# but ships it ClusterIP-only with a fixed default basic-auth password. When
+# k0rdent_ui_enabled=true, after MKE4k is installed we:
+#   1. rotate the UI password to a random value via the Management/kcm object
+#      (spec.core.kcm.config.k0rdent-ui.auth.basic.password)
+#   2. publish the UI over HTTPS through a dedicated Envoy gateway + NLB listener
+#      (same pattern as the KOF Grafana gateway).
+# Nothing new is pulled (the UI image, Envoy, cert-manager already exist), so the
+# only online/airgap difference is whether kubectl runs locally or on the bastion
+# (via _msr_kexec, defined in the MSR4 section below).
+# ---------------------------------------------------------------------------
+
+k0rdent_ui_credentials_file() {
+    printf '%s\n' "${TERRAFORM_DIR}/k0rdent_ui_credentials.txt"
+}
+
+# Get-or-create the random k0rdent UI password; persist to a 0600 creds file.
+# Echoes the password on stdout (info messages go to stderr).
+ensure_k0rdent_ui_credentials() {
+    local creds_file ui_pass
+    creds_file="$(k0rdent_ui_credentials_file)"
+
+    if [[ -f "${creds_file}" ]]; then
+        ui_pass="$(grep '^password=' "${creds_file}" | cut -d= -f2)"
+        [[ -n "${ui_pass}" ]] || die "k0rdent UI credentials file is malformed: ${creds_file}"
+        info "Reusing k0rdent UI credentials from $(basename "${creds_file}")" >&2
+    else
+        ui_pass="$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 20)"
+        printf 'username=admin\npassword=%s\n' "${ui_pass}" > "${creds_file}"
+        chmod 600 "${creds_file}"
+        info "Generated k0rdent UI credentials -> $(basename "${creds_file}")" >&2
+    fi
+
+    printf '%s\n' "${ui_pass}"
+}
+
+# Verify the cluster is reachable and the Management/kcm object + UI service + gateway
+# asset exist. Usage: k0rdent_ui_preflight <mode> <ssh_key> <bastion_ip>
+k0rdent_ui_preflight() {
+    local mode="$1" ssh_key="$2" bastion_ip="$3"
+    command -v yq >/dev/null 2>&1 || die "k0rdent UI requires 'yq' in PATH."
+    [[ -f "${PROJECT_ROOT}/k0rdent-ui/k0rdent-ui-gateway.yaml" ]] \
+        || die "Missing committed asset ${PROJECT_ROOT}/k0rdent-ui/k0rdent-ui-gateway.yaml."
+    _msr_kexec "${mode}" "${ssh_key}" "${bastion_ip}" "kubectl get nodes" >/dev/null 2>&1 \
+        || die "Cluster not reachable. Deploy MKE4k first."
+    _msr_kexec "${mode}" "${ssh_key}" "${bastion_ip}" "kubectl get management kcm" >/dev/null 2>&1 \
+        || die "Management object 'kcm' not found — is this an MKE4k (k0rdent Enterprise) cluster?"
+    _msr_kexec "${mode}" "${ssh_key}" "${bastion_ip}" "kubectl get svc -n k0rdent kcm-k0rdent-ui" >/dev/null 2>&1 \
+        || die "Service kcm-k0rdent-ui not found in namespace k0rdent."
+    return 0
+}
+
+# Rotate the k0rdent UI basic-auth password in the Management/kcm object.
+# JSON merge patch deep-merges into spec.core.kcm.config.k0rdent-ui, preserving
+# sibling keys (enabled stays true; any OIDC config is untouched).
+# Usage: k0rdent_ui_rotate_password <mode> <ssh_key> <bastion_ip>
+k0rdent_ui_rotate_password() {
+    local mode="$1" ssh_key="$2" bastion_ip="$3"
+    local ui_pass patch
+    ui_pass="$(ensure_k0rdent_ui_credentials)"
+    patch="{\"spec\":{\"core\":{\"kcm\":{\"config\":{\"k0rdent-ui\":{\"enabled\":true,\"auth\":{\"basic\":{\"enabled\":true,\"password\":\"${ui_pass}\"}}}}}}}}"
+
+    info "Rotating k0rdent UI password in Management/kcm..."
+    _msr_kexec "${mode}" "${ssh_key}" "${bastion_ip}" \
+        "kubectl patch management kcm --type merge -p '${patch}'" \
+        || die "Failed to patch Management/kcm."
+
+    info "Waiting for the k0rdent UI to roll out the new password..."
+    _msr_kexec "${mode}" "${ssh_key}" "${bastion_ip}" \
+        "kubectl -n k0rdent rollout status deploy/kcm-k0rdent-ui --timeout=5m" || true
+    return 0
+}
+
+# Apply the dedicated k0rdent UI Envoy gateway (Issuer/Certificate/EnvoyProxy/Gateway/
+# HTTPRoute). Pins the Envoy NodePort to k0rdent_ui_nodeport and fills the cert SANs
+# from terraform output. Online: kubectl applies locally; airgap: scp to bastion + apply.
+# Usage: k0rdent_ui_install_gateway <mode> <ssh_key> <bastion_ip> <tf_output_json>
+k0rdent_ui_install_gateway() {
+    local mode="$1" ssh_key="$2" bastion_ip="$3" output="$4"
+    local lb_dns
+    lb_dns="$(echo "${output}" | jq -r '.lb_dns_name.value // empty')"
+
+    # SANs: NLB DNS + node IPs (public online, private + 127.0.0.1 airgap).
+    local -a sans_ip=()
+    if [[ "${mode}" == "airgap" ]]; then
+        mapfile -t sans_ip < <(echo "${output}" | jq -r '(.controller_private_ips.value // [])[], (.worker_private_ips.value // [])[]' 2>/dev/null)
+        sans_ip+=("127.0.0.1")
+    else
+        mapfile -t sans_ip < <(echo "${output}" | jq -r '(.controller_ips.value // [])[], (.worker_ips.value // [])[]' 2>/dev/null)
+    fi
+
+    local gw
+    gw="$(mktemp "${TMPDIR:-/tmp}/k0rdent-ui-gw-XXXX.yaml")"
+    cp "${PROJECT_ROOT}/k0rdent-ui/k0rdent-ui-gateway.yaml" "${gw}"
+
+    NP="${k0rdent_ui_nodeport}" yq -i '
+        (select(.kind == "EnvoyProxy").spec.provider.kubernetes.envoyService.patch.value.spec.ports[0].nodePort)
+        = (strenv(NP) | tonumber)
+    ' "${gw}"
+
+    yq -i '(select(.kind == "Certificate").spec.dnsNames) = [] | (select(.kind == "Certificate").spec.ipAddresses) = []' "${gw}"
+    [[ -n "${lb_dns}" ]] && D="${lb_dns}" yq -i '(select(.kind == "Certificate").spec.dnsNames) += [strenv(D)]' "${gw}"
+    local ip
+    for ip in "${sans_ip[@]}"; do
+        [[ -n "${ip}" ]] && IP="${ip}" yq -i '(select(.kind == "Certificate").spec.ipAddresses) += [strenv(IP)]' "${gw}"
+    done
+    if [[ -z "${lb_dns}" && ${#sans_ip[@]} -eq 0 ]]; then
+        yq -i '(select(.kind == "Certificate").spec.dnsNames) = ["k0rdent-ui.local"]' "${gw}"
+    fi
+
+    info "Applying k0rdent UI Envoy gateway (NodePort ${k0rdent_ui_nodeport}, NLB :${k0rdent_ui_lb_port})..."
+    if [[ "${mode}" == "airgap" ]]; then
+        scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" "${gw}" "ubuntu@${bastion_ip}:/tmp/k0rdent-ui-gw.yaml"
+        rm -f "${gw}"
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+            export KUBECONFIG=~/.mke/mke.kubeconf
+            kubectl apply -f /tmp/k0rdent-ui-gw.yaml
+            rm -f /tmp/k0rdent-ui-gw.yaml
+            kubectl wait --for=condition=Ready certificate/k0rdent-ui -n k0rdent --timeout=2m || true
+            kubectl wait --for=condition=Programmed gateway/k0rdent-ui -n k0rdent --timeout=3m || true
+        "
+    else
+        kubectl apply -f "${gw}"
+        rm -f "${gw}"
+        kubectl wait --for=condition=Ready certificate/k0rdent-ui -n k0rdent --timeout=2m || true
+        kubectl wait --for=condition=Programmed gateway/k0rdent-ui -n k0rdent --timeout=3m || true
+    fi
+    return 0
+}
+
+# Print k0rdent UI access info + login. Usage: print_k0rdent_ui_summary <mode> <tf_output_json>
+print_k0rdent_ui_summary() {
+    local mode="$1" output="$2"
+    local ui_user ui_pass creds_file
+    creds_file="$(k0rdent_ui_credentials_file)"
+    ui_user="$(grep '^username=' "${creds_file}" 2>/dev/null | cut -d= -f2)"
+    ui_pass="$(grep '^password=' "${creds_file}" 2>/dev/null | cut -d= -f2)"
+
+    echo ""
+    echo -e "  ${BOLD}k0rdent UI (HTTPS, self-signed):${RESET}"
+    if [[ "${mode}" == "airgap" ]]; then
+        echo -e "    Access:  t tunnel k0rdent-ui   → https://localhost:${k0rdent_ui_lb_port}  (accept the cert)"
+    else
+        local lb_dns
+        lb_dns="$(echo "${output}" | jq -r '.lb_dns_name.value // empty' 2>/dev/null)"
+        echo -e "    Access:  https://${lb_dns:-<nlb-dns>}:${k0rdent_ui_lb_port}  (accept the cert)"
+        echo -e "             or https://<node-public-ip>:${k0rdent_ui_nodeport}"
+    fi
+    echo -e "    Login:   ${BOLD}${ui_user:-admin}${RESET} / ${BOLD}${ui_pass:-<see terraform/k0rdent_ui_credentials.txt>}${RESET}"
+    echo ""
+    return 0
+}
+
+cmd_deploy_k0rdent_ui() {
+    load_config
+    [[ "${k0rdent_ui_enabled}" == "true" ]] || die "k0rdent_ui_enabled is not true in config"
+
+    local output ssh_key bastion_ip mode
+    output="$(tf_output 2>/dev/null)" || die "Could not read terraform output. Has terraform been applied?"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    if [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" ]]; then
+        mode="airgap"
+    else
+        mode="online"; bastion_ip=""
+    fi
+
+    # The gateway needs an NLB listener + SG NodePort rule (terraform). Reconcile
+    # here so standalone 't deploy k0rdent-ui' also gets them (idempotent — a no-op
+    # when 't deploy lab' already applied with k0rdent_ui_enabled=true). Preserve the
+    # deployed mke3/airgap topology by reading it back from the existing tfvars.
+    info "Ensuring NLB listener + SG NodePort for the k0rdent UI gateway (terraform)..."
+    local mke3_tf airgap_tf="false"
+    [[ "${mode}" == "airgap" ]] && airgap_tf="true"
+    mke3_tf="$(grep -E '^mke3_enabled' "${TERRAFORM_DIR}/terraform.tfvars" 2>/dev/null | awk '{print $3}')"
+    write_tfvars "${mke3_tf:-false}" "${airgap_tf}"
+    tf_init
+    tf_apply
+    output="$(tf_output)"   # refresh after apply
+
+    k0rdent_ui_preflight "${mode}" "${ssh_key}" "${bastion_ip}"
+    k0rdent_ui_rotate_password "${mode}" "${ssh_key}" "${bastion_ip}"
+    k0rdent_ui_install_gateway "${mode}" "${ssh_key}" "${bastion_ip}" "${output}"
+
+    print_k0rdent_ui_summary "${mode}" "${output}"
+    success "k0rdent UI published."
+    return 0
+}
+
+cmd_destroy_k0rdent_ui() {
+    load_config
+    local output ssh_key bastion_ip mode
+    output="$(tf_output 2>/dev/null)" || die "Could not read terraform output. Has terraform been applied?"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    if [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" ]]; then
+        mode="airgap"
+    else
+        mode="online"; bastion_ip=""
+    fi
+
+    info "Removing k0rdent UI gateway resources..."
+    _msr_kexec "${mode}" "${ssh_key}" "${bastion_ip}" \
+        "kubectl delete -n k0rdent httproute/k0rdent-ui gateway/k0rdent-ui envoyproxy/k0rdent-ui-nodeport certificate/k0rdent-ui issuer/k0rdent-ui-selfsigned --ignore-not-found" || true
+    warn "The rotated UI password stays in Management/kcm (and terraform/k0rdent_ui_credentials.txt)."
+    warn "The NLB listener stays until you set k0rdent_ui_enabled=false and re-run 't deploy lab' (terraform)."
+    success "k0rdent UI gateway removed."
     return 0
 }
 
@@ -4372,6 +4600,17 @@ cmd_tunnel() {
             ssh -o StrictHostKeyChecking=no -i "${ssh_key}" \
                 -L "0.0.0.0:8444:${ctrl_priv_ip}:33443" -N "ubuntu@${bastion_pub_ip}"
             ;;
+        k0rdent-ui)
+            local ctrl_priv_ip
+            ctrl_priv_ip="$(echo "${output}" | jq -r '.controller_private_ips.value[0] // empty' 2>/dev/null)"
+            [[ -n "${ctrl_priv_ip}" && "${ctrl_priv_ip}" != "null" ]] \
+                || die "No controller private IP found. Is this an airgap cluster?"
+            info "Tunnelling k0rdent UI → https://localhost:${k0rdent_ui_lb_port}"
+            info "  (via bastion ${bastion_pub_ip} → controller ${ctrl_priv_ip}:${k0rdent_ui_nodeport})"
+            info "  Press Ctrl-C to stop."
+            ssh -o StrictHostKeyChecking=no -i "${ssh_key}" \
+                -L "0.0.0.0:${k0rdent_ui_lb_port}:${ctrl_priv_ip}:${k0rdent_ui_nodeport}" -N "ubuntu@${bastion_pub_ip}"
+            ;;
         "")
             echo ""
             echo -e "${BOLD}Available tunnels:${RESET}"
@@ -4379,6 +4618,7 @@ cmd_tunnel() {
             echo "  t tunnel dashboard    MKE4k Dashboard → https://localhost:3000"
             echo "  t tunnel mke3         MKE3 Dashboard  → https://localhost:3000"
             echo "  t tunnel msr4         MSR4 Harbor UI  → https://localhost:8444"
+            echo "  t tunnel k0rdent-ui   k0rdent UI      → https://localhost:${k0rdent_ui_lb_port}"
             echo ""
             echo -e "${BOLD}Harbor Registry (no tunnel needed — publicly accessible):${RESET}"
             echo "  https://${bastion_pub_ip}"
@@ -4399,16 +4639,21 @@ cmd_tunnel() {
                 echo "  # MSR4 Harbor (via controller NodePort)"
                 echo "  ssh -i ${ssh_key} -L 0.0.0.0:8444:${ctrl_priv_ip}:33443 -N ubuntu@${bastion_pub_ip}"
                 echo ""
+                if [[ "${k0rdent_ui_enabled:-false}" == "true" ]]; then
+                    echo "  # k0rdent UI (via controller NodePort)"
+                    echo "  ssh -i ${ssh_key} -L 0.0.0.0:${k0rdent_ui_lb_port}:${ctrl_priv_ip}:${k0rdent_ui_nodeport} -N ubuntu@${bastion_pub_ip}"
+                    echo ""
+                fi
             fi
             echo "  # Kubernetes API (for local kubectl)"
             echo "  ssh -i ${ssh_key} -L 0.0.0.0:6443:${lb_dns}:6443 -N ubuntu@${bastion_pub_ip}"
             echo ""
             if [[ -t 0 ]]; then
-                echo -e "${CYAN}Note: inside Docker, start with -p 3000:3000 -p 8443:8443 -p 8444:8444${RESET}"
+                echo -e "${CYAN}Note: inside Docker, start with -p 3000:3000 -p 8443:8443 -p 8444:8444 -p 8445:8445${RESET}"
             fi
             ;;
         *)
-            die "Unknown tunnel target: ${target}. Try: dashboard, mke3, msr4, registry"
+            die "Unknown tunnel target: ${target}. Try: dashboard, mke3, msr4, k0rdent-ui, registry"
             ;;
     esac
 }
@@ -4507,11 +4752,13 @@ usage() {
     echo "  deploy msr4                 Deploy MSR4 (Harbor) on existing cluster"
     echo "  deploy msr4 airgap          Deploy MSR4 via bastion Harbor registry"
     echo "  deploy kof                  Deploy KOF observability/FinOps (self-monitoring; cluster must exist)"
+    echo "  deploy k0rdent-ui           Rotate the k0rdent UI password + publish it via Envoy gateway"
     echo "  destroy cluster             Uninstall MKE4k (mkectl reset)"
     echo "  destroy cluster mke3        Uninstall MKE3 (launchpad reset)"
     echo "  destroy cluster airgap      Uninstall MKE4k from bastion"
     echo "  destroy cluster mke3-airgap Uninstall MKE3 from bastion"
     echo "  destroy kof                 Uninstall KOF (helm uninstall + delete ns kof)"
+    echo "  destroy k0rdent-ui          Remove the k0rdent UI gateway resources"
     echo "  destroy lab                 Destroy all AWS infrastructure (terraform destroy)"
     echo "  status                      Show cluster node status (kubectl get nodes)"
     echo "  show nodes                  Print controller/worker IPs and load balancer DNS"
@@ -4525,6 +4772,7 @@ usage() {
     echo "  tunnel dashboard            MKE4k Dashboard → https://localhost:3000"
     echo "  tunnel mke3                 MKE3 Dashboard  → https://localhost:3000"
     echo "  tunnel msr4                 MSR4 Harbor UI  → https://localhost:8444"
+    echo "  tunnel k0rdent-ui           k0rdent UI      → https://localhost:8445"
     echo ""
     echo "Prerequisites:"
     echo "  - AWS credentials exported (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)"
@@ -4585,7 +4833,8 @@ case "${COMMAND}" in
                 esac
                 ;;
             kof) cmd_deploy_kof ;;
-            *)         die "Unknown subcommand: t deploy ${SUBCOMMAND}. Try: lab, instances, cluster, registry, nfs, msr4, kof" ;;
+            k0rdent-ui) cmd_deploy_k0rdent_ui ;;
+            *)         die "Unknown subcommand: t deploy ${SUBCOMMAND}. Try: lab, instances, cluster, registry, nfs, msr4, kof, k0rdent-ui" ;;
         esac
         ;;
     destroy)
@@ -4601,7 +4850,8 @@ case "${COMMAND}" in
                 esac
                 ;;
             kof)     cmd_destroy_kof ;;
-            *)       die "Unknown subcommand: t destroy ${SUBCOMMAND}. Try: lab, cluster, kof" ;;
+            k0rdent-ui) cmd_destroy_k0rdent_ui ;;
+            *)       die "Unknown subcommand: t destroy ${SUBCOMMAND}. Try: lab, cluster, kof, k0rdent-ui" ;;
         esac
         ;;
     status)    cmd_status ;;

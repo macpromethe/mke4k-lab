@@ -38,6 +38,14 @@ resource "aws_security_group" "nlb" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  ingress {
+    description = "k0rdent UI"
+    from_port   = var.k0rdent_ui_lb_port
+    to_port     = var.k0rdent_ui_lb_port
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   # Outbound only to the cluster node SG on the backend ports
   egress {
     description     = "kube-api to cluster nodes"
@@ -67,6 +75,14 @@ resource "aws_security_group" "nlb" {
     description     = "KOF Grafana gateway to cluster nodes"
     from_port       = var.kof_grafana_nodeport
     to_port         = var.kof_grafana_nodeport
+    protocol        = "tcp"
+    security_groups = [aws_security_group.cluster_allow_ssh.id]
+  }
+
+  egress {
+    description     = "k0rdent UI gateway to cluster nodes"
+    from_port       = var.k0rdent_ui_nodeport
+    to_port         = var.k0rdent_ui_nodeport
     protocol        = "tcp"
     security_groups = [aws_security_group.cluster_allow_ssh.id]
   }
@@ -262,4 +278,49 @@ resource "aws_lb_target_group_attachment" "kof_grafana" {
   target_group_arn = aws_lb_target_group.kof_grafana[0].arn
   target_id        = aws_instance.cluster-controller[count.index].private_ip
   port             = var.kof_grafana_nodeport
+}
+
+# ---------------------------------------------------------------------------
+# k0rdent UI — dedicated listener + target group → Envoy gateway NodePort
+# (TCP pass-through; the k0rdent UI Envoy gateway terminates TLS). Gated on the toggle.
+# ---------------------------------------------------------------------------
+resource "aws_lb_target_group" "k0rdent_ui" {
+  count       = var.k0rdent_ui_enabled ? 1 : 0
+  name        = "${var.cluster_name}-k0rdent-ui"
+  port        = var.k0rdent_ui_nodeport
+  protocol    = "TCP"
+  target_type = "ip"
+  vpc_id      = aws_vpc.lab.id
+
+  health_check {
+    protocol            = "TCP"
+    port                = "traffic-port"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    interval            = 10
+  }
+
+  tags = {
+    Name    = "${var.cluster_name}-k0rdent-ui"
+    Cluster = var.cluster_name
+  }
+}
+
+resource "aws_lb_listener" "k0rdent_ui" {
+  count             = var.k0rdent_ui_enabled ? 1 : 0
+  load_balancer_arn = aws_lb.cluster.arn
+  port              = var.k0rdent_ui_lb_port
+  protocol          = "TCP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.k0rdent_ui[0].arn
+  }
+}
+
+resource "aws_lb_target_group_attachment" "k0rdent_ui" {
+  count            = var.k0rdent_ui_enabled ? var.controller_count : 0
+  target_group_arn = aws_lb_target_group.k0rdent_ui[0].arn
+  target_id        = aws_instance.cluster-controller[count.index].private_ip
+  port             = var.k0rdent_ui_nodeport
 }

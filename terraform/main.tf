@@ -138,6 +138,15 @@ resource "aws_security_group" "cluster_allow_ssh" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # k0rdent UI gateway NodePort
+  ingress {
+    description = "k0rdent UI gateway NodePort"
+    from_port   = var.k0rdent_ui_nodeport
+    to_port     = var.k0rdent_ui_nodeport
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   # HTTP ingress
   ingress {
     description = "HTTP"

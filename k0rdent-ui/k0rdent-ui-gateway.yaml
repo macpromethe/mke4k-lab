@@ -1,0 +1,108 @@
+# Dedicated Envoy Gateway exposing the k0rdent Enterprise UI over HTTPS, for MKE4k
+# (Gateway API + Envoy Gateway, GatewayClass "mke-gateway-ingress"). Applied by
+# 't deploy k0rdent-ui' when k0rdent_ui_enabled=true. The UI (service
+# kcm-k0rdent-ui:3000) is installed by MKE4k itself as part of k0rdent Enterprise;
+# here we only publish it.
+#
+# Why a dedicated gateway (not MKE's mke-gateway-ingress-* in the mke namespace):
+# those gateways use allowedRoutes.namespaces.from=Same, so a k0rdent-namespace
+# route can't attach without a cross-namespace ReferenceGrant + their shared cert.
+# A dedicated gateway in the k0rdent namespace keeps everything same-namespace and
+# self-contained.
+#
+# 't deploy k0rdent-ui' substitutes before applying:
+#   - the EnvoyProxy NodePort  -> k0rdent_ui_nodeport (so terraform's NLB target
+#     group forwards to a known port; merged into the Envoy Service by port 443)
+#   - the Certificate SANs      -> NLB DNS + node IPs (from terraform output)
+# TLS terminates here (self-signed); the NLB listener is plain TCP pass-through.
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: k0rdent-ui-selfsigned
+  namespace: k0rdent
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: k0rdent-ui
+  namespace: k0rdent
+spec:
+  secretName: k0rdent-ui-tls
+  issuerRef:
+    name: k0rdent-ui-selfsigned
+    kind: Issuer
+  # dnsNames / ipAddresses are populated by 't deploy k0rdent-ui' from terraform
+  # output (NLB DNS + node IPs). A placeholder keeps the CR valid standalone.
+  dnsNames:
+    - k0rdent-ui.local
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: k0rdent-ui-nodeport
+  namespace: k0rdent
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: NodePort
+        # Pin the NodePort so the terraform NLB target group can target it, and
+        # force externalTrafficPolicy: Cluster. Envoy Gateway defaults NodePort
+        # services to `Local`, which only accepts traffic on the node running the
+        # Envoy pod. The NLB attaches controller IPs, but this pod has no
+        # control-plane toleration so it lands on a worker — with `Local` the
+        # controller NodePort refuses the health check. `Cluster` makes every
+        # node forward to the pod wherever it runs. (MKE's gateway does the same.)
+        # StrategicMerge merges Service.spec.ports by the `port` key.
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              externalTrafficPolicy: Cluster
+              ports:
+                - port: 443
+                  nodePort: 33003
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: k0rdent-ui
+  namespace: k0rdent
+spec:
+  gatewayClassName: mke-gateway-ingress
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: k0rdent-ui-nodeport
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      allowedRoutes:
+        namespaces:
+          from: Same
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: k0rdent-ui-tls
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: k0rdent-ui
+  namespace: k0rdent
+spec:
+  parentRefs:
+    - name: k0rdent-ui
+  # No hostnames: this dedicated listener serves only the k0rdent UI, so it matches
+  # any host — reach it by NLB DNS / node IP without /etc/hosts.
+  rules:
+    - backendRefs:
+        - name: kcm-k0rdent-ui
+          port: 3000

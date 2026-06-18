@@ -103,3 +103,21 @@ variable "kof_grafana_lb_port" {
   default     = 8443
   description = "NLB listener port for KOF Grafana (TCP pass-through; the gateway terminates TLS)"
 }
+
+variable "k0rdent_ui_enabled" {
+  type        = bool
+  default     = false
+  description = "When true, add an NLB listener + target group forwarding to the k0rdent UI Envoy gateway NodePort"
+}
+
+variable "k0rdent_ui_nodeport" {
+  type        = number
+  default     = 33003
+  description = "NodePort the k0rdent UI Envoy gateway is pinned to (opened in the cluster SG; NLB forwards here)"
+}
+
+variable "k0rdent_ui_lb_port" {
+  type        = number
+  default     = 8445
+  description = "NLB listener port for the k0rdent UI (TCP pass-through; the gateway terminates TLS)"
+}
