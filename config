@@ -93,8 +93,11 @@ airgap_msr_version="v4.13.3"
 # ============================================================
 
 # -- Instances --
-# EC2 instance type for all nodes. Minimum recommended: m5.xlarge (4 vCPU / 16 GB).
-cluster_flavor="m5.xlarge"
+# EC2 instance type per role. Controllers run the control plane (also carry the
+# controller+worker role in single-node/HA); workers run your workloads.
+# Minimum recommended for controllers: 4 vCPU / 16 GB.
+controller_flavor="m5a.xlarge"
+worker_flavor="m5a.large"
 
 # Ubuntu version for all nodes: ubuntu-22.04 | ubuntu-24.04
 os_distro="ubuntu-22.04"

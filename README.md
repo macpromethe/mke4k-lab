@@ -95,7 +95,8 @@ vi config
 cluster_name="mke4k-lab"       # auto-suffixed with random 4-char ID (e.g. mke4k-lab-a3f2)
 controller_count=1
 worker_count=1
-cluster_flavor="m5.xlarge"
+controller_flavor="m5a.xlarge"
+worker_flavor="m5a.large"
 region="eu-central-1"
 mke4k_version="v4.2.0"
 os_distro="ubuntu-22.04"       # ubuntu-22.04 or ubuntu-24.04
@@ -449,8 +450,8 @@ mke4k-lab/
 | `aws_subnet` (public) | `172.31.0.0/24` with `map_public_ip_on_launch` |
 | `tls_private_key` + `aws_key_pair` | RSA-4096 key pair, PEM saved to `terraform/aws_private.pem` |
 | `aws_security_group` | Ports 22, 443, 6443, 9443, 33001, 30080 + intra-cluster |
-| `aws_instance` (controllers) | Ubuntu, `m5.xlarge` (configurable), 50GB gp3 |
-| `aws_instance` (workers) | Same as controllers |
+| `aws_instance` (controllers) | Ubuntu, `m5a.xlarge` (configurable), 50GB gp3 |
+| `aws_instance` (workers) | Ubuntu, `m5a.large` (configurable), 50GB gp3 |
 | `aws_lb` (NLB) | Public NLB in public subnet (internal in airgap) |
 | `aws_lb_target_group` x3 | kube-api (6443), controller-join (9443), ingress (33001) — all **IP-type** |
 | `aws_iam_role` + `aws_iam_policy` | AWS CCM minimum permissions (when `ccm_enabled`, auto-disabled in airgap) |
@@ -526,7 +527,8 @@ t destroy lab
 | `cluster_name` | `mke4k-lab` | Name prefix for all resources. Left as default, a random 4-char suffix is auto-appended (e.g. `mke4k-lab-a3f2`) to avoid collisions between users. Persisted in `.cluster-id` |
 | `controller_count` | `1` | Number of controller nodes (use 3 for HA) |
 | `worker_count` | `1` | Number of worker nodes |
-| `cluster_flavor` | `m5.xlarge` | EC2 instance type |
+| `controller_flavor` | `m5a.xlarge` | EC2 instance type for controllers |
+| `worker_flavor` | `m5a.large` | EC2 instance type for workers |
 | `region` | `eu-central-1` | AWS region |
 | `os_distro` | `ubuntu-22.04` | OS: `ubuntu-22.04` or `ubuntu-24.04` |
 | `ccm_enabled` | `false` | Creates IAM role; required for LoadBalancer services. Auto-disabled in airgap |

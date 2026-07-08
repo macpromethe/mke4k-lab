@@ -96,7 +96,8 @@ Edit `config` before deploying. Key variables:
 | `cluster_name` | `mke4k-lab` | Name prefix for all AWS resources. Left as default, a random 4-char suffix is auto-appended (e.g. `mke4k-lab-a3f2`) to avoid collisions. Persisted in `.cluster-id` |
 | `controller_count` | `1` | Use 3 for HA (must be odd) |
 | `worker_count` | `1` | |
-| `cluster_flavor` | `m5.xlarge` | Minimum recommended |
+| `controller_flavor` | `m5a.xlarge` | Controller instance type (4 vCPU / 16 GB min recommended) |
+| `worker_flavor` | `m5a.large` | Worker instance type |
 | `region` | `eu-central-1` | |
 | `mke4k_version` | `v4.2.0` | mkectl is auto-downloaded at this version |
 | `os_distro` | `ubuntu-22.04` | `ubuntu-22.04` or `ubuntu-24.04` |

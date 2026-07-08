@@ -13,9 +13,14 @@ variable "worker_count" {
   default = 1
 }
 
-variable "cluster_flavor" {
+variable "controller_flavor" {
   type    = string
-  default = "m5.xlarge"
+  default = "m5a.xlarge"
+}
+
+variable "worker_flavor" {
+  type    = string
+  default = "m5a.large"
 }
 
 variable "region" {

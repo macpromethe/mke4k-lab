@@ -89,7 +89,8 @@ load_config() {
     : "${cluster_name:?cluster_name not set in config}"
     : "${controller_count:?controller_count not set in config}"
     : "${worker_count:?worker_count not set in config}"
-    : "${cluster_flavor:?cluster_flavor not set in config}"
+    : "${controller_flavor:?controller_flavor not set in config}"
+    : "${worker_flavor:?worker_flavor not set in config}"
     : "${region:?region not set in config}"
     : "${mke4k_version:?mke4k_version not set in config}"
     : "${os_distro:?os_distro not set in config}"
@@ -191,7 +192,8 @@ write_tfvars() {
 cluster_name             = "${cluster_name}"
 controller_count         = ${controller_count}
 worker_count             = ${worker_count}
-cluster_flavor           = "${cluster_flavor}"
+controller_flavor        = "${controller_flavor}"
+worker_flavor            = "${worker_flavor}"
 region                   = "${region}"
 mke4k_version            = "${mke4k_version}"
 os_distro                = "${os_distro}"

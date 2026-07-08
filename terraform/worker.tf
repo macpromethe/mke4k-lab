@@ -1,7 +1,7 @@
 resource "aws_instance" "cluster-workers" {
   count                  = var.worker_count
   ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.cluster_flavor
+  instance_type          = var.worker_flavor
   key_name               = aws_key_pair.cluster.key_name
   iam_instance_profile   = var.ccm_enabled ? aws_iam_instance_profile.mke4k_ccm[0].name : null
   vpc_security_group_ids = [aws_security_group.cluster_allow_ssh.id]
