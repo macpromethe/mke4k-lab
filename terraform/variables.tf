@@ -9,6 +9,27 @@ variable "owner" {
   default = ""
 }
 
+# Auto-delete the whole lab this many days after creation (0 = never).
+# Drives the self-contained expiry reaper in expiry.tf.
+variable "expiry_days" {
+  type    = number
+  default = 3
+}
+
+# When true, the reaper Lambda logs what it would delete but deletes nothing.
+variable "expiry_dry_run" {
+  type    = bool
+  default = false
+}
+
+# Anchor for the expiry countdown (RFC3339). Empty = use the lab's creation
+# time (normal deploys). 't expiry <N>' sets this to "now" so the new deadline
+# is now + expiry_days rather than creation + expiry_days.
+variable "expiry_base" {
+  type    = string
+  default = ""
+}
+
 variable "controller_count" {
   type    = number
   default = 1

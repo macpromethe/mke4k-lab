@@ -77,3 +77,8 @@ output "nfs_server_public_ip" {
   description = "Public IP of the NFS server (empty in airgap mode)"
   value       = var.nfs_enabled ? (var.airgap_enabled ? "" : aws_instance.nfs_server[0].public_ip) : ""
 }
+
+output "expiry_time" {
+  description = "UTC time the auto-expiry reaper deletes the lab (empty = never)"
+  value       = var.expiry_days > 0 ? time_offset.expiry[0].rfc3339 : ""
+}

@@ -75,6 +75,22 @@ fmt_duration() {
     printf "%dm %02ds" $(( s / 60 )) $(( s % 60 ))
 }
 
+# Format the reaper's expiry-time output ("2026-07-24T12:00:00Z") for a
+# summary box: "2026-07-24 12:00 UTC (${expiry_days}d)". Empty input -> never.
+fmt_expiry() {
+    local t="$1"
+    if [[ -z "${t}" ]]; then
+        printf "never (expiry_days=0)"
+        return
+    fi
+    t="${t/T/ }"        # 2026-07-24 12:00:00Z
+    t="${t%Z}"          # 2026-07-24 12:00:00
+    t="${t%:*}"         # 2026-07-24 12:00
+    local suffix=""
+    [[ "${expiry_dry_run:-false}" == "true" ]] && suffix=" [DRY-RUN]"
+    printf "%s UTC (%sd)%s" "${t}" "${expiry_days:-?}" "${suffix}"
+}
+
 # ---------------------------------------------------------------------------
 # Source config and write terraform.tfvars
 # ---------------------------------------------------------------------------
@@ -148,6 +164,21 @@ load_config() {
 
     # ccm_enabled defaults to true if not present in config
     ccm_enabled="${ccm_enabled:-true}"
+
+    # Auto-expiry: whole-lab teardown N days after creation (0 = never).
+    # '.expiry-days' / '.expiry-base' override files (written by 't expiry')
+    # take precedence over config so the imperative deadline survives later
+    # tfvars regeneration; delete them (or 't destroy lab') to reset to config.
+    if [[ -f "${PROJECT_ROOT}/.expiry-days" ]]; then
+        expiry_days="$(cat "${PROJECT_ROOT}/.expiry-days")"
+    else
+        expiry_days="${expiry_days:-3}"
+    fi
+    [[ "${expiry_days}" =~ ^[0-9]+$ ]] || die "expiry_days must be a non-negative integer (got: ${expiry_days})"
+    # Countdown anchor: empty = creation time; set to "now" by 't expiry <N>'.
+    expiry_base="$(cat "${PROJECT_ROOT}/.expiry-base" 2>/dev/null || true)"
+    # Dry-run mode for the reaper (logs would-delete, deletes nothing).
+    expiry_dry_run="${expiry_dry_run:-false}"
 
     # MKE3 defaults (only used when deploying MKE3)
     mke3_version="${mke3_version:-3.8.2}"
@@ -248,6 +279,9 @@ worker_count             = ${worker_count}
 controller_flavor        = "${controller_flavor}"
 worker_flavor            = "${worker_flavor}"
 region                   = "${region}"
+expiry_days              = ${expiry_days}
+expiry_dry_run           = ${expiry_dry_run}
+expiry_base              = "${expiry_base:-}"
 mke4k_version            = "${mke4k_version}"
 os_name                  = "${os_name}"
 os_version               = "${os_version}"
@@ -2685,6 +2719,7 @@ print_deploy_summary() {
     sep
     bline "$(printf '  %-12s %-20s %s' 'Cluster' "${cluster_name}" "${region}")"
     bline "$(printf '  %-12s %-20s %s' 'MKE4k' "${mke4k_version}" "${ccm_str}")"
+    bline "$(printf '  %-12s %s' 'Expires' "$(fmt_expiry "$(echo "${output}" | jq -r '.expiry_time.value // empty' 2>/dev/null)")")"
     if [[ -n "${nfs_priv_ip}" && "${nfs_priv_ip}" != "" ]]; then
         bline "$(printf '  %-12s %s' 'NFS' "${nfs_priv_ip} (${nfs_export_path})")"
     fi
@@ -2792,6 +2827,7 @@ print_mke3_deploy_summary() {
     bline "$(printf '  %-12s %-20s %s' 'Cluster' "${cluster_name}" "${region}")"
     bline "$(printf '  %-12s %s' 'MKE3' "${mke3_version}")"
     bline "$(printf '  %-12s %s' 'MCR' "${mcr_version} (${mcr_channel})")"
+    bline "$(printf '  %-12s %s' 'Expires' "$(fmt_expiry "$(echo "${output}" | jq -r '.expiry_time.value // empty' 2>/dev/null)")")"
     if [[ ${_T_TERRAFORM} -gt 0 ]]; then
         sep
         bline "  Timing"
@@ -2885,6 +2921,7 @@ print_airgap_deploy_summary() {
     cline "mke4k-lab -- Airgap Deploy Summary"
     sep
     bline "$(printf '  %-18s %s' 'MKE4k version' "${mke4k_version}")"
+    bline "$(printf '  %-18s %s' 'Expires' "$(fmt_expiry "$(echo "${output}" | jq -r '.expiry_time.value // empty' 2>/dev/null)")")"
     bline "$(printf '  %-18s %s' 'Controllers' "${controller_count}")"
     bline "$(printf '  %-18s %s' 'Workers' "${worker_count}")"
     bline "$(printf '  %-18s %s' 'Registry' "MSR4 ${airgap_msr_version}")"
@@ -3004,6 +3041,7 @@ print_mke3_airgap_deploy_summary() {
     bline "$(printf '  %-18s %s' 'MCR' "${mcr_version} (${mcr_channel})")"
     bline "$(printf '  %-18s %s' 'Registry' "MSR4 ${airgap_msr_version}")"
     bline "$(printf '  %-18s %s' 'Airgap' 'true')"
+    bline "$(printf '  %-18s %s' 'Expires' "$(fmt_expiry "$(echo "${output}" | jq -r '.expiry_time.value // empty' 2>/dev/null)")")"
     sep
     bline "$(printf '  %-18s %s' 'Bastion (public)' "${bastion_pub_ip}")"
     bline "$(printf '  %-18s %s' 'Registry host' "${registry_hostname}")"
@@ -3360,7 +3398,73 @@ cmd_destroy_lab() {
     load_config
     write_tfvars
     tf_destroy
+    # Clear any 't expiry' override so a future lab starts from config defaults.
+    rm -f "${PROJECT_ROOT}/.expiry-days" "${PROJECT_ROOT}/.expiry-base"
     success "Lab destroyed."
+}
+
+# Reaper resources only — an 't expiry' apply must never touch the cluster.
+_EXPIRY_TARGETS=(
+    -target=time_offset.expiry
+    -target=aws_iam_role.reaper
+    -target=aws_iam_role_policy.reaper
+    -target=aws_lambda_function.reaper
+    -target=aws_iam_role.scheduler
+    -target=aws_iam_role_policy.scheduler
+    -target=aws_scheduler_schedule.expiry
+)
+
+# t expiry [<days>|off|show] — view, change, or disable the lab's auto-expiry.
+# Changing it re-arms the reaper to "now + <days>" and applies ONLY the reaper
+# resources (a targeted apply), so a running cluster is never touched.
+cmd_expiry() {
+    local arg="${1:-show}"
+    load_config
+    tf_output >/dev/null 2>&1 || die "No lab found (no terraform state). Deploy a lab first with 't deploy lab'."
+
+    if [[ "${arg}" == "show" ]]; then
+        local et
+        et="$(tf_output 2>/dev/null | jq -r '.expiry_time.value // empty')"
+        if [[ -z "${et}" ]]; then
+            info "Auto-expiry: disabled (the lab will not self-delete)."
+        else
+            info "Auto-expiry: $(fmt_expiry "${et}")"
+            info "  change with 't expiry <days>', disable with 't expiry off'."
+        fi
+        return 0
+    fi
+
+    case "${arg}" in
+        off|never|0)
+            echo "0" > "${PROJECT_ROOT}/.expiry-days"
+            rm -f "${PROJECT_ROOT}/.expiry-base"
+            info "Disabling auto-expiry (removing the reaper)..."
+            ;;
+        *)
+            [[ "${arg}" =~ ^[1-9][0-9]*$ ]] || die "Usage: t expiry [<days≥1>|off|show]"
+            date -u +%Y-%m-%dT%H:%M:%SZ > "${PROJECT_ROOT}/.expiry-base"
+            echo "${arg}" > "${PROJECT_ROOT}/.expiry-days"
+            info "Re-arming auto-expiry to ${arg} day(s) from now..."
+            ;;
+    esac
+
+    # Reload so expiry_* reflect the new override files, then regenerate tfvars
+    # preserving the deployed topology (mke3/airgap flags read back from tfvars).
+    load_config
+    local airgap_tf mke3_tf
+    mke3_tf="$(grep -E '^mke3_enabled'   "${TERRAFORM_DIR}/terraform.tfvars" 2>/dev/null | awk '{print $3}')"
+    airgap_tf="$(grep -E '^airgap_enabled' "${TERRAFORM_DIR}/terraform.tfvars" 2>/dev/null | awk '{print $3}')"
+    write_tfvars "${mke3_tf:-false}" "${airgap_tf:-false}"
+
+    terraform -chdir="${TERRAFORM_DIR}" apply -auto-approve -compact-warnings "${_EXPIRY_TARGETS[@]}"
+
+    local et
+    et="$(tf_output 2>/dev/null | jq -r '.expiry_time.value // empty')"
+    if [[ -z "${et}" ]]; then
+        success "Auto-expiry disabled — the lab will NOT self-delete. Remember to 't destroy lab' when done."
+    else
+        success "Auto-expiry updated: $(fmt_expiry "${et}")"
+    fi
 }
 
 cmd_deploy_nfs() {
@@ -6166,6 +6270,7 @@ usage() {
     echo "  destroy kof                 Uninstall KOF (helm uninstall + delete ns kof)"
     echo "  destroy k0rdent-ui          Remove the k0rdent UI gateway resources"
     echo "  destroy lab                 Destroy all AWS infrastructure (terraform destroy)"
+    echo "  expiry [<days>|off|show]    Show/change/disable auto-expiry (re-arms to now+<days>; targeted apply)"
     echo "  status                      Show cluster node status (kubectl get nodes)"
     echo "  show nodes                  Print controller/worker IPs and load balancer DNS"
     echo "  show summary                Reprint the deploy summary box (credentials, URLs, IPs)"
@@ -6283,6 +6388,7 @@ case "${COMMAND}" in
         esac
         ;;
     status)    cmd_status ;;
+    expiry)    cmd_expiry "${SUBCOMMAND}" ;;
     show)
         case "${SUBCOMMAND}" in
             nodes)   cmd_show_nodes ;;

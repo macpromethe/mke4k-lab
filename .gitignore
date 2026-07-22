@@ -1,5 +1,7 @@
 .cluster-id
 .owner
+.expiry-days
+.expiry-base
 .claude
 .DS_Store
 mke3/
@@ -24,6 +26,7 @@ terraform/msr4_tls.crt
 terraform/msr4_tls.key
 terraform/msr4_tls.csr
 terraform/msr4_redis_password.txt
+terraform/reaper.zip
 
 # Local-only personal notes (never tracked)
 kof/MKE4-INTEGRATION.md
@@ -32,3 +35,4 @@ kof/KOF-RUNBOOK.md
 kof/KOF-ON-MKE4.md
 kof/KOF-QUICKSTART.md
 .markdownlint.json
+__pycache__/

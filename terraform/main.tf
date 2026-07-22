@@ -9,6 +9,16 @@ terraform {
       source  = "hashicorp/tls"
       version = "~> 4.0"
     }
+    # Stable creation timestamp for the expiry reaper (expiry.tf)
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.12"
+    }
+    # Zips the reaper Lambda source (expiry.tf)
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.0"
+    }
   }
 }
 

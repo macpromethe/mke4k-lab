@@ -20,6 +20,10 @@ cluster_name="mke4k-lab"
 # AWS region to deploy into. Must match your credentials' scope.
 region="eu-central-1"
 
+# Auto-delete the whole lab this many days after creation (0 = never).
+# Adjust a running lab with 't expiry <days>'; 't destroy lab' cancels it.
+expiry_days=3
+
 # Control plane: use 3 for HA (must be odd). Workers run your workloads.
 controller_count=1
 worker_count=1
@@ -119,6 +123,10 @@ ccm_enabled=false
 
 # true -> mkectl runs with -l debug (very verbose).
 debug=true
+
+# Dry-run the expiry reaper: true -> the reaper Lambda logs what it *would*
+# delete (CloudWatch) but deletes nothing. Use it to verify scope, then unset.
+expiry_dry_run=false
 
 # -- k0rdent UI gateway (used when k0rdent_ui_enabled=true) --
 # NodePort the Envoy gateway is pinned to (MKE4k range 32768-35535; 33001/33002/33443 taken).

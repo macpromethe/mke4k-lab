@@ -1,4 +1,7 @@
 .cluster-id
+.owner
+.expiry-days
+.expiry-base
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/.terraform/
@@ -18,6 +21,7 @@ terraform/msr4_tls.crt
 terraform/msr4_tls.key
 terraform/msr4_tls.csr
 terraform/msr4_redis_password.txt
+terraform/reaper.zip
 mke3/
 .DS_Store
 .git
