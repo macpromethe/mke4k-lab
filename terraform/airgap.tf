@@ -41,14 +41,14 @@ resource "aws_instance" "bastion" {
   instance_type          = var.airgap_registry_flavor
   key_name               = aws_key_pair.cluster.key_name
   vpc_security_group_ids = [aws_security_group.cluster_allow_ssh.id]
-  subnet_id = aws_subnet.public.id
+  subnet_id              = aws_subnet.public.id
 
+  # FQDN hostname, consistent with the cluster nodes — see controller.tf
   user_data = <<-EOF
-    #!/bin/bash
-    HOSTNAME=$(curl -s http://169.254.169.254/latest/meta-data/hostname)
-    echo $HOSTNAME > /etc/hostname
-    sed -i "s|\(127\.0\..\..*\)localhost|\1$HOSTNAME|" /etc/hosts
-    hostname $HOSTNAME
+    #cloud-config
+    preserve_hostname: false
+    prefer_fqdn_over_hostname: true
+    manage_etc_hosts: localhost
   EOF
 
   root_block_device {

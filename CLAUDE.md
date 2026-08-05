@@ -124,9 +124,10 @@ Edit `config` before deploying. Key variables:
 
 1. `t deploy lab` sources `config` → writes `terraform/terraform.tfvars`
 2. `terraform init + apply` provisions: dedicated VPC (172.31.0.0/16), public subnet, RSA-4096 keypair, security group, EC2 instances, NLB with IP-type target groups (6443, 9443, 33001), IAM role+policy for CCM
-3. Wait 60 s for NLB to become active
-4. `generate_mke4_yaml`: calls `mkectl init` for the schema, then patches it with `yq` using controller/worker IPs and NLB DNS from `terraform output -json`
-5. `mkectl apply -f terraform/mke4.yaml` installs MKE4k; kubeconfig lands at `~/.mke/mke.kubeconf`
+3. `ensure_node_hostnames`: verifies every node's hostname is the EC2 `PrivateDnsName` FQDN (repairs it over SSH if not) — CCM matches Nodes by that name
+4. Wait 60 s for NLB to become active
+5. `generate_mke4_yaml`: calls `mkectl init` for the schema, then patches it with `yq` using controller/worker IPs and NLB DNS from `terraform output -json`
+6. `mkectl apply -f terraform/mke4.yaml` installs MKE4k; kubeconfig lands at `~/.mke/mke.kubeconf`
 
 ### Deploy flow (airgap)
 
@@ -134,7 +135,7 @@ Edit `config` before deploying. Key variables:
 2. `terraform apply` provisions: dedicated VPC (172.31.0.0/16), public subnet (172.31.0.0/24) + private subnet (172.31.1.0/24), bastion EC2 in public subnet, controller/worker EC2s in private subnet (no internet), **internal** NLB in private subnet with IP-type target groups
 3. `setup_registry`: installs MCR (docker-ee) + bind9 + MSR4 (Harbor) on bastion; generates self-signed TLS cert (SAN=registry FQDN + bastion IP); creates Harbor project `mke`
 4. `setup_node_dns`: configures each cluster node's resolver → bastion bind9 + `/etc/hosts` fallback for registry hostname (systemd-resolved on Ubuntu; NetworkManager `dns=none` + direct /etc/resolv.conf on RHEL). Runs early so RHEL dnf-via-Squid can resolve RHUI
-5. `setup_rhel_node_prereqs` (RHEL nodes only): disables nm-cloud-setup (+reboot — k0s incompatibility), disables firewalld/nftables; SELinux stays enforcing for MKE 4.1.3+ (supported), permissive for older target versions
+5. `ensure_node_hostnames` (FQDN hostname check on every node — see *Node hostnames*), then `setup_rhel_node_prereqs` (RHEL nodes only): disables nm-cloud-setup (+reboot — k0s incompatibility), disables firewalld/nftables; SELinux stays enforcing for MKE 4.1.3+ (supported), permissive for older target versions
 6. `ensure_mkectl_on_bastion`: installs mkectl + kubectl on bastion (moved before bundle upload so mkectl is available for dual-path mode)
 7. `upload_mke4k_bundle`: downloads MKE4k OCI bundle on bastion, uploads all images/charts to Harbor via containerised skopeo (`quay.io/skopeo/stable:v1.18.0`). Supports `standard` (filesystem scan) and `dual-path` (v4.1.3 workaround) modes
 8. NFS (when enabled): `install_nfs_client_on_nodes` — Ubuntu nodes get `.deb`s bundled on the bastion; RHEL nodes install `nfs-utils` via dnf through a bastion Squid proxy against RHUI (transient `--setopt=proxy=`, no persistent proxy state)
@@ -149,7 +150,7 @@ Edit `config` before deploying. Key variables:
 3. `setup_registry`: installs MCR + bind9 + MSR4 (Harbor) on bastion (reused from MKE4k airgap)
 4. `upload_mke3_images`: downloads `ucp_images_<version>.tar.gz` on bastion, `docker load` + retag + push to Harbor `mke3` project
 5. `setup_node_dns`: configures cluster nodes' resolver → bastion bind9 (reused; systemd-resolved on Ubuntu, NetworkManager `dns=none` + /etc/resolv.conf on RHEL)
-6. `setup_rhel_node_prereqs` (RHEL only): disables nm-cloud-setup (+reboot), disables firewalld; SELinux enforcing kept on MKE 4.1.3+
+6. `ensure_node_hostnames` (FQDN hostname check on every node — see *Node hostnames*), then `setup_rhel_node_prereqs` (RHEL only): disables nm-cloud-setup (+reboot), disables firewalld; SELinux enforcing kept on MKE 4.1.3+
 7. `setup_squid_proxy`: installs Squid forward proxy on bastion (port 3128), ACL allows only private subnet to Mirantis/Docker/Ubuntu/RedHat(RHUI) domains
 8. `setup_node_proxy`: configures each cluster node with apt (Ubuntu) or dnf (RHEL) proxy, environment proxy vars, sudoers env_keep, and Docker registry CA cert
 9. `ensure_launchpad_on_bastion`: installs launchpad binary on bastion
@@ -166,7 +167,7 @@ Edit `config` before deploying. Key variables:
 - **`bin/cleanup-aws.sh`** — emergency AWS cleanup when Terraform state is lost; finds resources by cluster tag, interactive confirmation
 - **`terraform/vpc.tf`** — dedicated VPC (172.31.0.0/16), internet gateway, public subnet (172.31.0.0/24), route table
 - **`terraform/main.tf`** — provider config, keypair, AMI lookups (`node` = ubuntu/redhat per `os_name`/`os_version`, `bastion` = always Ubuntu), security group
-- **`terraform/controller.tf` / `worker.tf`** — EC2 instances (public subnet normally, private subnet in airgap)
+- **`terraform/controller.tf` / `worker.tf`** — EC2 instances (public subnet normally, private subnet in airgap). All four instance resources (these two plus `airgap.tf` bastion and `nfs.tf`) share the same `#cloud-config` `user_data` that forces the FQDN hostname — see *Node hostnames must be the FQDN (CCM)*
 - **`terraform/loadbalancer.tf`** — NLB + IP-type target groups + listeners; internal NLB in private subnet when airgap
 - **`terraform/airgap.tf`** — private subnet (172.31.1.0/24), route table (no IGW), bastion EC2 in public subnet; gated by `airgap_enabled`
 - **`terraform/mke3_loadbalancer.tf`** — MKE3 NLB (443, 6443); gated by `mke3_enabled`
@@ -197,6 +198,7 @@ Edit `config` before deploying. Key variables:
 - **IP-type target groups**: NLB target groups use `target_type = "ip"` (not instance). This is critical for `controller+worker` nodes where the kubelet bootstraps through the NLB back to itself (hairpin routing). AWS NLBs do not support hairpin with instance-type targets
 - **Internal NLB for airgap**: When `airgap_enabled`, the NLB is placed in the private subnet as an internal LB. Cluster nodes resolve it via VPC DNS (forwarded through bastion's bind9)
 - **CCM auto-disabled in airgap**: The AWS cloud controller manager requires access to `ec2.amazonaws.com` which is unreachable from the private subnet. `generate_mke4_yaml` forces `cloudProvider.enabled=false` when airgap=true
+- **Node hostnames must be the FQDN (CCM)**: The Kubernetes node name is the OS hostname — MKE4k/launchpad expose no `nodeName`/`--hostname-override` knob — and AWS CCM resolves a Node to an instance by matching that name against the instance's `PrivateDnsName`. A short hostname yields `failed to get instance metadata for node ip-a-b-c-d: instance not found` forever, so the node never gets `providerID`, zone/region labels, or its `uninitialized` taint removed. Ubuntu's cloud-init defaults to the **short** name (`prefer_fqdn = False` in the Debian distro class; RHEL's sets `True`), so `user_data` on all four instances is a `#cloud-config` forcing `prefer_fqdn_over_hostname: true` + `preserve_hostname: false` — cloud-init fetches `local-hostname` itself over IMDSv2 and re-applies it every boot. `manage_etc_hosts` must stay `localhost`: `true` re-renders `/etc/hosts` from the template each boot and would wipe the airgap registry entry `setup_node_dns` adds. Because `user_data` only runs at first boot (and changing it does not recycle a live instance), `ensure_node_hostnames` independently verifies/repairs the FQDN over SSH before every install — IMDSv2 → IMDSv1 → derive from the primary IP, and it hard-fails when `ccm_enabled=true` and the FQDN can't be set. Do not reintroduce a `curl`-based `user_data` hostname script: the previous one used unauthenticated IMDSv1, and when that returned empty it truncated `/etc/hostname` to nothing
 - **DNS chain (airgap)**: cluster node → local resolver → bastion bind9 → VPC DNS (172.31.0.2). Ubuntu: systemd-resolved. RHEL: NetworkManager gets `dns=none` and /etc/resolv.conf points directly at the bastion (survives DHCP renewals/reboots). Registry hostname (`registry.<cluster>.local`) is served by bind9; all other queries forwarded to VPC DNS. `/etc/hosts` fallback on all nodes for the registry hostname
 - **Registry TLS**: Self-signed cert with SAN covering both FQDN and bastion IP. CA embedded as `caData` in mke4.yaml; mkectl configures containerd trust on each node. Bastion has cert in `/etc/docker/certs.d/` for both FQDN and IP
 - **Bundle upload**: Containerised skopeo (`quay.io/skopeo/stable:v1.18.0`) with `--add-host` for DNS resolution inside the container. Filenames decoded: `&` → `/`, `@` → `:`. Two modes: `standard` (filesystem scan, default) and `dual-path` (v4.1.3 workaround — uses `mkectl airgap list-images/list-charts` to enumerate artifacts, uploads `registry.mirantis.com/mke/*` images to both `<registry>/mke/<path>` and `<registry>/mke/mke/<path>` to work around mkectl v4.1.3's double-prefix bug)

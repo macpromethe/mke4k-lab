@@ -705,6 +705,139 @@ RESOLVEOF
 }
 
 # ---------------------------------------------------------------------------
+# Cluster node hostnames — must equal the EC2 PrivateDnsName (FQDN)
+# ---------------------------------------------------------------------------
+# The Kubernetes node name is the OS hostname (MKE4k/launchpad expose no
+# nodeName/--hostname-override knob), and the AWS cloud controller manager
+# resolves a Node to an instance by matching that name against the instance's
+# PrivateDnsName. A short hostname yields:
+#   failed to get instance metadata for node ip-a-b-c-d: instance not found
+#
+# terraform user_data already asks cloud-init for the FQDN
+# (prefer_fqdn_over_hostname), but that only runs at first boot and only on
+# instances created after that change — so verify/repair here before install.
+# Runs for every OS. IMDS is link-local, so this works in airgap and needs no
+# DNS — hence it can run before setup_node_dns. It is called before
+# setup_rhel_node_prereqs so that the RHEL reboot there re-asserts the name.
+ensure_node_hostnames() {
+    local output ssh_key bastion_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    local is_airgap=false
+    [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" && "${bastion_ip}" != "" ]] && is_airgap=true
+
+    local all_ips=()
+    if [[ "${is_airgap}" == "true" ]]; then
+        mapfile -t all_ips < <(echo "${output}" | jq -r '.controller_private_ips.value[], .worker_private_ips.value[]' 2>/dev/null)
+    else
+        mapfile -t all_ips < <(echo "${output}" | jq -r '.controller_ips.value[], .worker_ips.value[]' 2>/dev/null)
+    fi
+    [[ ${#all_ips[@]} -eq 0 ]] && { warn "No cluster node IPs found — skipping hostname check."; return; }
+
+    info "Verifying FQDN hostname on ${#all_ips[@]} cluster node(s)..."
+
+    # REGION is interpolated locally; the rest is single-quoted (no local
+    # expansion). IMDSv2 first, IMDSv1 second, derive-from-IP last — never write
+    # an unvalidated value to /etc/hostname.
+    local hostname_script="REGION='${region}'
+"'
+        set -uo pipefail
+        IMDS=http://169.254.169.254
+
+        TOKEN="$(curl -s -m 3 -X PUT "$IMDS/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 300" 2>/dev/null || true)"
+        FQDN=""
+        if [ -n "$TOKEN" ]; then
+            FQDN="$(curl -s -m 3 -H "X-aws-ec2-metadata-token: $TOKEN" \
+                "$IMDS/latest/meta-data/local-hostname" 2>/dev/null || true)"
+        fi
+        if [ -z "$FQDN" ]; then
+            FQDN="$(curl -s -m 3 "$IMDS/latest/meta-data/local-hostname" 2>/dev/null || true)"
+        fi
+        if [ -z "$FQDN" ]; then
+            # No IMDS: rebuild the name AWS assigns from the primary IP
+            IP="$(hostname -I 2>/dev/null | cut -d" " -f1)"
+            if [ -n "$IP" ]; then
+                SUFFIX="$REGION.compute.internal"
+                [ "$REGION" = "us-east-1" ] && SUFFIX="ec2.internal"
+                FQDN="ip-$(echo "$IP" | tr . -).$SUFFIX"
+            fi
+        fi
+
+        # Must be the dotted ip-a-b-c-d.<domain> form — a bare short name is
+        # exactly the failure being fixed
+        case "$FQDN" in
+            ip-[0-9]*-[0-9]*-[0-9]*-[0-9]*.?*) ;;
+            *) echo "HOSTNAME_UNRESOLVED"; exit 0 ;;
+        esac
+
+        if [ "$(hostname)" = "$FQDN" ] && [ "$(cat /etc/hostname 2>/dev/null)" = "$FQDN" ]; then
+            echo "HOSTNAME_OK $FQDN"
+            exit 0
+        fi
+
+        # hostnamectl (not "hostname"): persists /etc/hostname AND updates the
+        # systemd static/transient names
+        sudo hostnamectl set-hostname "$FQDN" || { echo "HOSTNAME_SET_FAILED"; exit 0; }
+        SHORT="${FQDN%%.*}"
+        # Map the FQDN on 127.0.1.1 (Debian convention), leaving every other
+        # /etc/hosts entry alone — the airgap registry entry lives here too
+        if ! grep -qE "^127\.0\.1\.1[[:space:]]+$FQDN([[:space:]]|$)" /etc/hosts; then
+            sudo sed -i "/^127\.0\.1\.1[[:space:]]/d" /etc/hosts
+            printf "127.0.1.1\t%s %s\n" "$FQDN" "$SHORT" | sudo tee -a /etc/hosts >/dev/null
+        fi
+        # Restore the localhost alias if an earlier revision of this lab clobbered
+        # it (the old user_data sed replaced "localhost" with the hostname)
+        if ! grep -qE "^127\.0\.0\.1[[:space:]]+.*localhost" /etc/hosts; then
+            sudo sed -i "/^127\.0\.0\.1[[:space:]]/d" /etc/hosts
+            printf "127.0.0.1\tlocalhost\n" | sudo tee -a /etc/hosts >/dev/null
+        fi
+        echo "HOSTNAME_FIXED $FQDN"
+    '
+
+    local node_ip node_out fixed=0
+    for node_ip in "${all_ips[@]}"; do
+        if [[ "${is_airgap}" == "true" ]]; then
+            wait_for_ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "node ${node_ip}"
+            node_out="$(ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "${hostname_script}" 2>&1 || true)"
+        else
+            wait_for_ssh_host "$(node_ssh_user)" "${ssh_key}" "${node_ip}" "node ${node_ip}"
+            node_out="$(ssh_host "$(node_ssh_user)" "${ssh_key}" "${node_ip}" "${hostname_script}" 2>&1 || true)"
+        fi
+
+        case "${node_out}" in
+            *HOSTNAME_OK*)
+                info "  hostname → ${node_ip} ($(awk '/HOSTNAME_OK/ {print $2}' <<<"${node_out}"))"
+                ;;
+            *HOSTNAME_FIXED*)
+                warn "  hostname → ${node_ip} repaired to $(awk '/HOSTNAME_FIXED/ {print $2}' <<<"${node_out}")"
+                fixed=$((fixed + 1))
+                ;;
+            *)
+                # Wrong node name breaks CCM outright — fail loudly rather than
+                # hand back a cluster whose nodes never initialise
+                local msg="Could not set the FQDN hostname on ${node_ip}: ${node_out}"
+                # Only CCM actually depends on the name matching, and it is
+                # always disabled in airgap (no AWS API access)
+                if [[ "${ccm_enabled:-false}" == "true" && "${is_airgap}" != "true" ]]; then
+                    die "${msg}
+CCM matches nodes by PrivateDnsName and will report 'instance not found'.
+Set ccm_enabled=false in config to deploy without the cloud provider."
+                fi
+                warn "${msg}"
+                ;;
+        esac
+    done
+
+    if [[ ${fixed} -gt 0 ]]; then
+        success "Node hostnames verified (${fixed} repaired)."
+    else
+        success "Node hostnames verified."
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # RHEL cluster node preparation (no-op for Ubuntu)
 # ---------------------------------------------------------------------------
 # - nm-cloud-setup: enabled on RHEL EC2 AMIs; its routing rules are a documented
@@ -3104,6 +3237,7 @@ cmd_deploy_lab_mke4() {
     tf_init
     tf_apply
     timer_phase_end _T_TERRAFORM
+    ensure_node_hostnames      # node name must equal the EC2 PrivateDnsName (CCM)
     setup_rhel_node_prereqs    # no-op for Ubuntu
     wait_for_lb
     timer_phase_end _T_NLB
@@ -3136,6 +3270,7 @@ cmd_deploy_lab_mke3() {
     tf_init
     tf_apply
     timer_phase_end _T_TERRAFORM
+    ensure_node_hostnames      # node name must equal the EC2 PrivateDnsName (CCM)
     setup_rhel_node_prereqs    # no-op for Ubuntu
     wait_for_lb
     timer_phase_end _T_NLB
@@ -3157,6 +3292,7 @@ cmd_deploy_instances() {
     write_tfvars false
     tf_init
     tf_apply
+    ensure_node_hostnames      # node name must equal the EC2 PrivateDnsName (CCM)
     generate_mke4_yaml
     success "Instances deployed. Run 't deploy cluster' to install MKE4k."
 }
@@ -3166,18 +3302,21 @@ cmd_deploy_instances_mke3() {
     write_tfvars true
     tf_init
     tf_apply
+    ensure_node_hostnames      # node name must equal the EC2 PrivateDnsName (CCM)
     generate_launchpad_yaml
     success "Instances deployed. Run 't deploy cluster mke3' to install MKE3."
 }
 
 cmd_deploy_cluster() {
     load_config
+    ensure_node_hostnames      # node name must equal the EC2 PrivateDnsName (CCM)
     setup_rhel_node_prereqs    # no-op for Ubuntu
     mkectl_apply
 }
 
 cmd_deploy_cluster_mke3() {
     load_config
+    ensure_node_hostnames      # node name must equal the EC2 PrivateDnsName (CCM)
     setup_rhel_node_prereqs    # no-op for Ubuntu
     generate_launchpad_yaml
     launchpad_apply
@@ -3210,6 +3349,7 @@ cmd_deploy_lab_airgap() {
 
     setup_node_dns             # Point each node's resolver at bastion — must run
                                # before any RHEL dnf-via-Squid (RHUI resolution)
+    ensure_node_hostnames      # node name must equal the EC2 PrivateDnsName (CCM)
     setup_rhel_node_prereqs    # no-op for Ubuntu
 
     local output ssh_key bastion_ip
@@ -3278,6 +3418,7 @@ cmd_deploy_registry() {
 cmd_deploy_cluster_airgap() {
     load_config
     setup_node_dns             # Ensure DNS is configured before mkectl
+    ensure_node_hostnames      # node name must equal the EC2 PrivateDnsName (CCM)
     setup_rhel_node_prereqs    # no-op for Ubuntu
     local output ssh_key bastion_ip
     output="$(tf_output)"
@@ -3322,6 +3463,7 @@ cmd_deploy_lab_mke3_airgap() {
     timer_phase_end _T_MKE3_IMAGES
 
     setup_node_dns             # Point each node's resolver at bastion
+    ensure_node_hostnames      # node name must equal the EC2 PrivateDnsName (CCM)
     setup_rhel_node_prereqs    # no-op for Ubuntu
 
     setup_squid_proxy          # Squid on bastion for MCR package installs
@@ -3372,6 +3514,7 @@ cmd_deploy_registry_mke3() {
 cmd_deploy_cluster_mke3_airgap() {
     load_config
     setup_node_dns
+    ensure_node_hostnames      # node name must equal the EC2 PrivateDnsName (CCM)
     setup_rhel_node_prereqs    # no-op for Ubuntu
     setup_squid_proxy
     setup_node_proxy
