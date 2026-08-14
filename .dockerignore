@@ -13,6 +13,9 @@ terraform/mke3_credentials.txt
 terraform/registry_credentials.txt
 terraform/registry_ca.crt
 terraform/launchpad.yaml
+terraform/mke3-config.toml
+terraform/mke3-config.toml.bak
+terraform/mke4.yaml.bak
 terraform/nodes.yaml
 terraform/msr4_ca.crt
 terraform/msr4_ca.key

@@ -265,6 +265,35 @@ ensure_msr4_admin_credentials() {
     printf '%s\n' "${admin_pass}"
 }
 
+mke3_credentials_file() {
+    printf '%s\n' "${TERRAFORM_DIR}/mke3_credentials.txt"
+}
+
+# Echo the MKE3 admin credentials as "<username>\t<password>".
+# Consume with:  IFS=$'\t' read -r user pass < <(read_mke3_credentials)
+# Falls back to mke3_admin_username / a "(see ...)" placeholder for display-only
+# callers; pass "strict" to die instead when the file is missing or malformed.
+read_mke3_credentials() {
+    local strict="${1:-}"
+    local creds_file admin_user admin_pass
+    creds_file="$(mke3_credentials_file)"
+
+    admin_user="$(grep '^username=' "${creds_file}" 2>/dev/null | cut -d= -f2 || true)"
+    admin_pass="$(grep '^password=' "${creds_file}" 2>/dev/null | cut -d= -f2 || true)"
+
+    if [[ "${strict}" == "strict" ]]; then
+        [[ -f "${creds_file}" ]] \
+            || die "MKE3 credentials not found: ${creds_file}. Deploy MKE3 first (t deploy lab mke3)."
+        [[ -n "${admin_user}" && -n "${admin_pass}" ]] \
+            || die "MKE3 credentials file is malformed: ${creds_file}"
+    else
+        [[ -n "${admin_user}" ]] || admin_user="${mke3_admin_username:-admin}"
+        [[ -n "${admin_pass}" ]] || admin_pass="(see ${creds_file})"
+    fi
+
+    printf '%s\t%s\n' "${admin_user}" "${admin_pass}"
+}
+
 write_tfvars() {
     local mke3_enabled="${1:-false}"
     local airgap_enabled="${2:-false}"
@@ -323,6 +352,20 @@ tf_destroy() {
 
 tf_output() {
     terraform -chdir="${TERRAFORM_DIR}" output -json 2>/dev/null
+}
+
+# Echo "airgap" or "online" based on whether terraform provisioned a bastion.
+# Optional arg: a pre-fetched tf_output JSON blob (avoids a second terraform call).
+detect_deploy_mode() {
+    local output="${1:-}"
+    [[ -n "${output}" ]] || output="$(tf_output)"
+    local bastion_ip
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    if [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" ]]; then
+        printf 'airgap\n'
+    else
+        printf 'online\n'
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -2099,6 +2142,183 @@ ensure_mke3_client_bundle() {
     echo "${bundle_dir}"
 }
 
+# ---------------------------------------------------------------------------
+# MKE3 configuration file (TOML)
+# https://docs.mirantis.com/mke/3.9/ops/administer-cluster/configure-an-mke-cluster/use-an-mke-configuration-file.html
+#
+# GET/PUT https://<mke3-nlb>/api/ucp/config-toml, authenticated with a bearer
+# token from POST /auth/login. Online the NLB is public and curl runs locally;
+# in airgap the MKE3 NLB is *internal*, so login + transfer both run on the
+# bastion in a single ssh call (token never leaves the bastion). The bastion has
+# no jq, so the remote side parses the token with sed, and the login payload is
+# handed over base64-encoded to sidestep shell quoting entirely.
+# ---------------------------------------------------------------------------
+
+mke3_config_file() {
+    printf '%s\n' "${TERRAFORM_DIR}/mke3-config.toml"
+}
+
+# Resolve the MKE3 API host (the MKE3 NLB DNS name) from terraform output.
+# Optional arg: a pre-fetched tf_output JSON blob.
+mke3_api_host() {
+    local output="${1:-}"
+    [[ -n "${output}" ]] || output="$(tf_output)"
+    local mke3_lb_dns
+    mke3_lb_dns="$(echo "${output}" | jq -r '.mke3_lb_dns_name.value // empty' 2>/dev/null)"
+    [[ -n "${mke3_lb_dns}" && "${mke3_lb_dns}" != "null" ]] \
+        || die "mke3_lb_dns_name is empty. Was terraform applied with mke3_enabled=true?"
+    printf '%s\n' "${mke3_lb_dns}"
+}
+
+# Build the /auth/login JSON body from terraform/mke3_credentials.txt.
+# jq -n does the quoting, so odd characters in the password are safe.
+mke3_login_payload() {
+    local creds admin_user admin_pass
+    # Not a process substitution: read_mke3_credentials must be able to abort
+    # the caller, and a dying <(...) subshell would go unnoticed here.
+    creds="$(read_mke3_credentials strict)" || exit 1
+    IFS=$'\t' read -r admin_user admin_pass <<< "${creds}"
+    jq -nc --arg u "${admin_user}" --arg p "${admin_pass}" '{username:$u,password:$p}'
+}
+
+# POST /auth/login from this host -> auth token on stdout. Online mode only.
+mke3_api_login() {
+    local host="$1" payload="$2"
+    local token
+    # `|| true` so a connection failure lands on the die below (set -e/pipefail)
+    token="$(curl -sk --max-time 30 --data "${payload}" \
+        "https://${host}/auth/login" 2>/dev/null | jq -r '.auth_token // empty' 2>/dev/null || true)"
+    [[ -n "${token}" ]] \
+        || die "MKE3 login failed at https://${host}/auth/login. Check $(basename "$(mke3_credentials_file)") and that the cluster is up."
+    printf '%s\n' "${token}"
+}
+
+# Remote (bastion) prologue: decode the login payload and export TOKEN.
+# Emitted into the ssh command string; the caller appends the actual curl call.
+_mke3_remote_login_snippet() {
+    local host="$1" payload_b64="$2"
+    cat <<REMOTE
+set -eo pipefail
+LOGIN=\$(printf '%s' '${payload_b64}' | base64 -d)
+TOKEN=\$(curl -sk --max-time 30 --data "\${LOGIN}" "https://${host}/auth/login" \
+    | sed -n 's/.*"auth_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+if [ -z "\${TOKEN}" ]; then
+    echo "ERROR: MKE3 login failed at https://${host}/auth/login" >&2
+    exit 1
+fi
+REMOTE
+}
+
+# Fetch the running MKE3 config into terraform/mke3-config.toml.
+# Usage: mke3_config_get <online|airgap> [dest_file]
+mke3_config_get() {
+    local mode="$1"
+    local dest="${2:-$(mke3_config_file)}"
+    local output host payload tmp
+    output="$(tf_output)" || die "Could not read terraform output. Has terraform been applied?"
+    host="$(mke3_api_host "${output}")"
+    payload="$(mke3_login_payload)"
+    tmp="$(mktemp)"
+
+    info "Fetching MKE3 config from https://${host}/api/ucp/config-toml (${mode})..."
+
+    if [[ "${mode}" == "airgap" ]]; then
+        local ssh_key bastion_ip payload_b64
+        ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+        bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+        payload_b64="$(printf '%s' "${payload}" | openssl base64 -A)"
+
+        if ! ssh_node "${ssh_key}" "${bastion_ip}" "
+$(_mke3_remote_login_snippet "${host}" "${payload_b64}")
+curl -sk --max-time 60 -X GET \"https://${host}/api/ucp/config-toml\" \
+    -H 'accept: application/toml' \
+    -H \"Authorization: Bearer \${TOKEN}\"
+" < /dev/null > "${tmp}"; then
+            rm -f "${tmp}"
+            die "Failed to fetch the MKE3 config from the bastion."
+        fi
+    else
+        local token
+        token="$(mke3_api_login "${host}" "${payload}")"
+        if ! curl -sk --max-time 60 -X GET "https://${host}/api/ucp/config-toml" \
+            -H 'accept: application/toml' \
+            -H "Authorization: Bearer ${token}" -o "${tmp}"; then
+            rm -f "${tmp}"
+            die "Failed to fetch the MKE3 config from https://${host}."
+        fi
+    fi
+
+    # Guard against an error page / empty body landing in the file
+    [[ -s "${tmp}" ]] || { rm -f "${tmp}"; die "MKE3 returned an empty config. Is the cluster up?"; }
+    if ! grep -q '^\[' "${tmp}"; then
+        local preview
+        preview="$(head -c 200 "${tmp}")"
+        rm -f "${tmp}"
+        die "MKE3 config response is not TOML (no [table] header). First bytes: ${preview}"
+    fi
+
+    mv "${tmp}" "${dest}"
+    chmod 600 "${dest}"
+}
+
+# Push a TOML file back to the cluster. Re-acquires the auth token immediately
+# before the upload (tokens expire; the docs warn about this explicitly).
+# Usage: mke3_config_apply <online|airgap> [src_file]
+mke3_config_apply() {
+    local mode="$1"
+    local src="${2:-$(mke3_config_file)}"
+    [[ -s "${src}" ]] || die "${src} not found or empty. Run 't config get mke3' first."
+    grep -q '^\[' "${src}" || die "${src} does not look like an MKE3 config (no [table] header)."
+
+    local output host payload
+    output="$(tf_output)" || die "Could not read terraform output. Has terraform been applied?"
+    host="$(mke3_api_host "${output}")"
+    payload="$(mke3_login_payload)"
+
+    info "Uploading MKE3 config to https://${host}/api/ucp/config-toml (${mode})..."
+
+    if [[ "${mode}" == "airgap" ]]; then
+        local ssh_key bastion_ip payload_b64
+        ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+        bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+        payload_b64="$(printf '%s' "${payload}" | openssl base64 -A)"
+
+        scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" \
+            "${src}" "ubuntu@${bastion_ip}:~/mke3-config.toml" \
+            || die "Failed to copy ${src} to the bastion."
+
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+$(_mke3_remote_login_snippet "${host}" "${payload_b64}")
+CODE=\$(curl -sk --max-time 120 -o /tmp/mke3-config-put.out -w '%{http_code}' \
+    -X PUT -H 'accept: application/toml' \
+    -H \"Authorization: Bearer \${TOKEN}\" \
+    --upload-file ~/mke3-config.toml \
+    \"https://${host}/api/ucp/config-toml\")
+echo \">>> HTTP \${CODE}\"
+if [ \"\${CODE#2}\" = \"\${CODE}\" ]; then
+    { cat /tmp/mke3-config-put.out; echo; } >&2
+    exit 1
+fi
+" < /dev/null || die "MKE3 rejected the config upload (see the response above)."
+    else
+        local token resp code
+        token="$(mke3_api_login "${host}" "${payload}")"
+        resp="$(mktemp)"
+        code="$(curl -sk --max-time 120 -o "${resp}" -w '%{http_code}' \
+            -X PUT -H 'accept: application/toml' \
+            -H "Authorization: Bearer ${token}" \
+            --upload-file "${src}" \
+            "https://${host}/api/ucp/config-toml")"
+        info "  HTTP ${code}"
+        if [[ "${code#2}" == "${code}" ]]; then
+            error "$(cat "${resp}")"
+            rm -f "${resp}"
+            die "MKE3 rejected the config upload (HTTP ${code})."
+        fi
+        rm -f "${resp}"
+    fi
+}
+
 deploy_nfs_provisioner_mke3() {
     local bundle_dir
     bundle_dir="$(ensure_mke3_client_bundle)"
@@ -2346,7 +2566,8 @@ generate_launchpad_yaml() {
     fi
 
     local launchpad_yaml="${TERRAFORM_DIR}/launchpad.yaml"
-    local creds_file="${TERRAFORM_DIR}/mke3_credentials.txt"
+    local creds_file
+    creds_file="$(mke3_credentials_file)"
     local output
     output="$(tf_output)" || die "Could not read terraform output. Has terraform been applied?"
 
@@ -2556,10 +2777,8 @@ prompt_upgrade_prep_airgap() {
             success "Upgrade files uploaded to bastion."
 
             # Read MKE3 credentials for the command
-            local creds_file="${TERRAFORM_DIR}/mke3_credentials.txt"
             local admin_user admin_pass
-            admin_user="$(grep '^username=' "${creds_file}" 2>/dev/null | cut -d= -f2 || echo "${mke3_admin_username}")"
-            admin_pass="$(grep '^password=' "${creds_file}" 2>/dev/null | cut -d= -f2 || echo "(see ${creds_file})")"
+            IFS=$'\t' read -r admin_user admin_pass < <(read_mke3_credentials)
 
             local mke4k_lb_dns
             mke4k_lb_dns="$(echo "${output}" | jq -r '.lb_dns_name.value')"
@@ -2932,10 +3151,8 @@ print_mke3_deploy_summary() {
     mapfile -t worker_ips     < <(echo "${output}" | jq -r '.worker_ips.value[]'     2>/dev/null)
 
     # Read credentials saved by generate_launchpad_yaml
-    local creds_file="${TERRAFORM_DIR}/mke3_credentials.txt"
     local admin_user admin_pass
-    admin_user="$(grep '^username=' "${creds_file}" 2>/dev/null | cut -d= -f2 || echo "${mke3_admin_username}")"
-    admin_pass="$(grep '^password=' "${creds_file}" 2>/dev/null | cut -d= -f2 || echo "(see ${creds_file})")"
+    IFS=$'\t' read -r admin_user admin_pass < <(read_mke3_credentials)
 
     local nodes_yaml="${TERRAFORM_DIR}/nodes.yaml"
 
@@ -3142,10 +3359,8 @@ print_mke3_airgap_deploy_summary() {
     mapfile -t controller_ips < <(echo "${output}" | jq -r '.controller_private_ips.value[]' 2>/dev/null)
     mapfile -t worker_ips     < <(echo "${output}" | jq -r '.worker_private_ips.value[]'     2>/dev/null)
 
-    local creds_file="${TERRAFORM_DIR}/mke3_credentials.txt"
     local admin_user admin_pass
-    admin_user="$(grep '^username=' "${creds_file}" 2>/dev/null | cut -d= -f2 || echo "${mke3_admin_username}")"
-    admin_pass="$(grep '^password=' "${creds_file}" 2>/dev/null | cut -d= -f2 || echo "(see ${creds_file})")"
+    IFS=$'\t' read -r admin_user admin_pass < <(read_mke3_credentials)
 
     local reg_creds_file="${TERRAFORM_DIR}/registry_credentials.txt"
     local registry_pass
@@ -5061,24 +5276,34 @@ _msr_kexec() {
 fetch_current_mke4_yaml() {
     local mode="$1"
     local mke4_yaml="${TERRAFORM_DIR}/mke4.yaml"
-    local output ssh_key bastion_ip
+    local output ssh_key bastion_ip tmp
 
     info "Fetching current cluster config (mkectl config get, ${mode})..."
+
+    # Stage in a temp file — a failed fetch must not truncate an existing
+    # mke4.yaml (it is the deploy input for 't deploy cluster').
+    tmp="$(mktemp)"
 
     if [[ "${mode}" == "airgap" ]]; then
         output="$(tf_output)"
         ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
         bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+        # `|| true` so a failing mkectl reaches the checks below with a useful
+        # message instead of tripping set -e/pipefail silently.
         ssh_node "${ssh_key}" "${bastion_ip}" \
             "export KUBECONFIG=~/.mke/mke.kubeconf; mkectl config get 2>/dev/null" \
-            | sed -n '/^apiVersion:/,$p' > "${mke4_yaml}"
+            < /dev/null | sed -n '/^apiVersion:/,$p' > "${tmp}" || true
     else
-        mkectl config get 2>/dev/null | sed -n '/^apiVersion:/,$p' > "${mke4_yaml}"
+        mkectl config get 2>/dev/null | sed -n '/^apiVersion:/,$p' > "${tmp}" || true
     fi
 
-    [[ -s "${mke4_yaml}" ]] || die "mkectl config get returned empty output. Is the cluster up?"
+    [[ -s "${tmp}" ]] \
+        || { rm -f "${tmp}"; die "mkectl config get returned empty output. Is the cluster up?"; }
     # Sanity check
-    grep -q '^apiVersion:' "${mke4_yaml}" || die "mke4.yaml missing apiVersion header — check mkectl output"
+    grep -q '^apiVersion:' "${tmp}" \
+        || { rm -f "${tmp}"; die "mke4.yaml missing apiVersion header — check mkectl output"; }
+
+    mv "${tmp}" "${mke4_yaml}"
     info "  Wrote ${mke4_yaml} ($(wc -l < "${mke4_yaml}") lines)"
 }
 
@@ -5391,8 +5616,8 @@ EOF
 }
 
 # Run `mkectl apply -f mke4.yaml` — locally for online, on bastion for airgap.
-# Usage: msr4_mkectl_apply <online|airgap>
-msr4_mkectl_apply() {
+# Usage: mkectl_apply_mode <online|airgap>
+mkectl_apply_mode() {
     local mode="$1"
     local mke4_yaml="${TERRAFORM_DIR}/mke4.yaml"
     [[ -f "${mke4_yaml}" ]] || die "mke4.yaml not found — fetch_current_mke4_yaml first"
@@ -5644,7 +5869,7 @@ deploy_msr4_ha_backends() {
     prepare_msr4_redis_services   "${mode}" "${redis_registry}"
 
     info "HA Round 1 — running mkectl apply (postgres + redis in one shot)..."
-    msr4_mkectl_apply "${mode}"
+    mkectl_apply_mode "${mode}"
 
     wait_for_pods "${mode}" "msr" "app.kubernetes.io/name=postgres-operator" \
         "postgres-operator pod" "600s"
@@ -5755,7 +5980,7 @@ EOF
     add_service_to_mke4_yaml "msr" "msr-${msr4_version}" "msr" "${values_file}"
     rm -f "${values_file}"
 
-    msr4_mkectl_apply "${mode}"
+    mkectl_apply_mode "${mode}"
 
     wait_for_pods "${mode}" "msr" "component=core" "MSR4 core pod" "900s"
     success "MSR4 (Harbor) deployed"
@@ -6379,6 +6604,139 @@ cmd_gen_client_bundle() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# t config — read and update the configuration of the RUNNING cluster
+# ---------------------------------------------------------------------------
+# mke4 (default): `mkectl config get` / `mkectl apply -f`, file terraform/mke4.yaml
+# mke3:           GET/PUT /api/ucp/config-toml, file terraform/mke3-config.toml
+# Both auto-detect airgap and run through the bastion when needed.
+
+# The file a given variant reads and writes.
+config_target_file() {
+    case "${1}" in
+        mke3) mke3_config_file ;;
+        *)    printf '%s\n' "${TERRAFORM_DIR}/mke4.yaml" ;;
+    esac
+}
+
+# Suffix appended to the hint commands printed back to the user ("" for mke4).
+_config_hint_suffix() {
+    [[ "${1}" == "mke3" ]] && printf ' mke3\n' || printf '\n'
+}
+
+cmd_config_get() {
+    local variant="${1:-mke4}"
+    load_config
+
+    local mode target suffix
+    mode="$(detect_deploy_mode)"
+    target="$(config_target_file "${variant}")"
+    suffix="$(_config_hint_suffix "${variant}")"
+
+    if [[ "${variant}" == "mke3" ]]; then
+        mke3_config_get "${mode}"
+        success "Wrote ${target} ($(wc -l < "${target}") lines)"
+    else
+        [[ "${mode}" == "airgap" ]] || ensure_mkectl
+        fetch_current_mke4_yaml "${mode}"
+        warn "This is the same file 't deploy cluster' generates — it will be regenerated on the next deploy."
+    fi
+
+    echo ""
+    echo "  Edit it, then push it back with:"
+    echo -e "    ${CYAN}t config apply${suffix}${RESET}"
+    echo "  Or do both in one step:"
+    echo -e "    ${CYAN}t config edit${suffix}${RESET}"
+    echo ""
+}
+
+# Shared tail of `apply` and `edit`: back up, confirm, push.
+# Usage: _config_push <variant> <mode> <target>
+_config_push() {
+    local variant="${1}" mode="${2}" target="${3}"
+
+    [[ -e /dev/tty ]] \
+        || die "Applying a config change needs an interactive terminal to confirm."
+
+    warn "Applying a config change restarts MKE components — expect a brief API interruption."
+    local answer
+    read -r -p "$(echo -e "  ${BOLD}Apply ${target} to the running cluster?${RESET} [y/N] ")" answer < /dev/tty
+    case "${answer}" in
+        [yY]|[yY][eE][sS]) ;;
+        *) info "Skipping — nothing was applied."; return 0 ;;
+    esac
+
+    # For MKE3 the PUT is a raw API call with no server-side history, so grab a
+    # fresh copy of the *running* config first — that is the rollback point.
+    if [[ "${variant}" == "mke3" ]]; then
+        info "Backing up the running config to $(basename "${target}").bak..."
+        mke3_config_get "${mode}" "${target}.bak"
+    else
+        cp "${target}" "${target}.bak"
+    fi
+
+    if [[ "${variant}" == "mke3" ]]; then
+        mke3_config_apply "${mode}" "${target}"
+    else
+        [[ "${mode}" == "airgap" ]] || ensure_mkectl
+        mkectl_apply_mode "${mode}"
+    fi
+
+    success "Config applied. Previous version kept at $(basename "${target}").bak"
+}
+
+cmd_config_apply() {
+    local variant="${1:-mke4}"
+    load_config
+
+    local mode target suffix
+    mode="$(detect_deploy_mode)"
+    target="$(config_target_file "${variant}")"
+    suffix="$(_config_hint_suffix "${variant}")"
+
+    [[ -s "${target}" ]] || die "${target} not found or empty. Run 't config get${suffix}' first."
+
+    _config_push "${variant}" "${mode}" "${target}"
+}
+
+cmd_config_edit() {
+    local variant="${1:-mke4}"
+    load_config
+
+    [[ -t 0 ]] || die "'t config edit' needs an interactive terminal. Use 't config get' + 't config apply' instead."
+
+    local mode target editor orig
+    mode="$(detect_deploy_mode)"
+    target="$(config_target_file "${variant}")"
+    editor="${EDITOR:-vi}"
+    command -v "${editor}" &>/dev/null || die "Editor '${editor}' not found. Set \$EDITOR."
+
+    # `|| true`: a bare `[[ ]] && cmd` that evaluates false would trip set -e
+    [[ -f "${target}" ]] && warn "Replacing ${target} with a fresh copy from the cluster." || true
+
+    if [[ "${variant}" == "mke3" ]]; then
+        mke3_config_get "${mode}"
+    else
+        [[ "${mode}" == "airgap" ]] || ensure_mkectl
+        fetch_current_mke4_yaml "${mode}"
+    fi
+
+    orig="$(mktemp)"
+    cp "${target}" "${orig}"
+
+    info "Opening ${target} in ${editor}..."
+    "${editor}" "${target}"
+
+    if cmp -s "${target}" "${orig}"; then
+        rm -f "${orig}"
+        info "No changes — nothing to apply."
+        return 0
+    fi
+    rm -f "${orig}"
+
+    _config_push "${variant}" "${mode}" "${target}"
+}
+
 usage() {
     echo ""
     echo -e "${BOLD}mke4k-lab — t CLI${RESET}"
@@ -6423,6 +6781,9 @@ usage() {
     echo "  connect <node> cmd          Run a single command on a node and return"
     echo "  gen client-bundle [mke3]    Download MKE3 client bundle (default)"
     echo "  gen client-bundle mke4      Show MKE4k kubeconfig path"
+    echo "  config get [mke4|mke3]      Pull the running cluster config to a local file"
+    echo "  config apply [mke4|mke3]    Push the edited config file back to the cluster"
+    echo "  config edit [mke4|mke3]     Pull → \$EDITOR → push (skipped if unchanged)"
     echo "  tunnel                      Show available SSH tunnels for airgap UIs"
     echo "  tunnel dashboard            MKE4k Dashboard → https://localhost:3000"
     echo "  tunnel mke3                 MKE3 Dashboard  → https://localhost:3000"
@@ -6544,6 +6905,17 @@ case "${COMMAND}" in
         case "${SUBCOMMAND}" in
             client-bundle) cmd_gen_client_bundle "${3:-mke3}" ;;
             *)             die "Unknown subcommand: t gen ${SUBCOMMAND}. Try: client-bundle" ;;
+        esac
+        ;;
+    config)
+        case "${SUBCOMMAND}" in
+            get|apply|edit)
+                case "${3:-mke4}" in
+                    mke4|mke3) "cmd_config_${SUBCOMMAND}" "${3:-mke4}" ;;
+                    *)         die "Unknown variant: t config ${SUBCOMMAND} ${3}. Try: mke4, mke3" ;;
+                esac
+                ;;
+            *) die "Unknown subcommand: t config ${SUBCOMMAND}. Try: get, apply, edit" ;;
         esac
         ;;
     tunnel)  cmd_tunnel "${SUBCOMMAND}" ;;
