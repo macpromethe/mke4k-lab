@@ -257,7 +257,7 @@ load_config() {
     child_ready_timeout="${child_ready_timeout:-30m}"
     child_delete_timeout="${child_delete_timeout:-30m}"
     child_admin_enabled="${child_admin_enabled:-true}"
-    child_ssh_enabled="${child_ssh_enabled:-false}"
+    child_ssh_enabled="${child_ssh_enabled:-true}"
     child_ssh_allowed_cidr="${child_ssh_allowed_cidr:-}"
     if [[ -n "${child_ssh_allowed_cidr}" ]]; then
         [[ "${child_ssh_allowed_cidr}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] \

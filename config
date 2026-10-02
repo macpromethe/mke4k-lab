@@ -11,101 +11,79 @@
 #  1. Basic setup
 # ============================================================
 
-# Name prefix for all AWS resources. Leave as "mke4k-lab" and the first
-# 't deploy lab|instances' will ask for your name (-> mke4k-lab-<name> and
-# an Owner tag on every resource, persisted in .cluster-id / .owner).
-# Non-interactive runs get a random suffix instead (e.g. mke4k-lab-a3f2).
+# Name prefix for all AWS resources. Leave as "mke4k-lab" and the first deploy
+# asks for your name (-> mke4k-lab-<name>, also tagged as Owner).
 cluster_name="mke4k-lab"
 
-# AWS region to deploy into. Must match your credentials' scope.
+# AWS region to deploy into.
 region="eu-central-1"
 
-# Auto-delete the whole lab this many days after creation (0 = never).
-# Adjust a running lab with 't expiry <days>'; 't destroy lab' cancels it.
+# Auto-delete the lab this many days after creation (0 = never).
+# Change it later with 't expiry <days>'.
 expiry_days=3
 
-# Control plane: use 3 for HA (must be odd). Workers run your workloads.
+# Node counts. Controllers: 1, or 3 for HA (must be odd).
 controller_count=1
 worker_count=1
 
+# Node OS: ubuntu (22.04, 24.04) | redhat (9.6, 8.10).
+os_name="ubuntu"
+os_version="22.04"
+
+# AWS Cloud Controller Manager: needed for LoadBalancer services and EBS volumes.
+# Always off in airgap.
+ccm_enabled=false
+
 # -- MKE4k --
-# mkectl is auto-downloaded at this version.
 # Releases: https://github.com/MirantisContainers/mke-release/releases
 mke4k_version="v4.2.0"
 
-# k0rdent UI (t deploy k0rdent-ui / t destroy k0rdent-ui)
-# true  -> UI will be available
-# false -> run 't deploy k0rdent-ui' once the cluster is already deployed
+# k0rdent UI. false -> deploy it later with 't deploy k0rdent-ui'.
 k0rdent_ui_enabled=false
 
-# -- MKE4k child cluster (t deploy child-cluster / t destroy child-cluster) --
-# Online MKE4k only. Run once the lab is up; k0rdent provisions the child via
-# CAPI (AWS) as '<cluster_name>-child', in its own VPC, using the container's
-# AWS credentials. 't destroy lab' deletes the child first.
-# NOTE: auto-expiry does NOT cover the child - destroy it before the lab expires.
+# -- MKE4k child cluster (t deploy child-cluster) --
+# Not part of 't deploy lab': a separate step, run after the cluster is up.
+# Online MKE4k only.
 child_control_plane_count=1
 child_worker_count=1
-# true -> create a Dex 'admin' login for the child UI (none is created by default);
-#         password -> terraform/child_credentials.txt, RBAC copied from this cluster's admin.
-child_admin_enabled=true
-# true -> SSH into child nodes ('t connect m1-child' / 'w1-child') through a CAPA
-#         bastion locked to your public IP (nodes stay private). Must be set
-#         BEFORE 't deploy child-cluster': the SSH key can't be added to a running child.
-child_ssh_enabled=false
+
+# -- MSR4 (t deploy msr4) --
+msr4_enabled=false
+msr4_version="4.13.3"
+# 1 = simple (built-in DB + Redis) | 2+ = HA (needs nfs_enabled=true)
+msr4_replicas=1
+
+# -- KOF observability (t deploy kof) --
+# Requires MKE 4.2.0+. true -> deploys automatically at the end of 't deploy lab'.
+kof_enabled=false
+# Must match the cluster's k0rdent release. Validated: 1.8.1 (MKE 4.2.0), 1.4.1 (MKE 4.2.1).
+kof_version="1.8.1"
+# lean = cluster monitoring only | full = complete observability + FinOps
+kof_mode="lean"
 
 # -- MKE3 (t deploy lab mke3) --
 mke3_version="3.8.2"
 mcr_version="25.0.14"
-# NOTE: As of launchpad 1.5.15, channel must match mcr_version exactly.
-# Pattern: stable-<major>.<minor>.<patch>  e.g. stable-25.0.14 for mcr_version 25.0.14
+# Must match mcr_version exactly: stable-<mcr_version>
 mcr_channel="stable-25.0.14"
 
-# -- NFS storage (works with all deploy modes) --
-# true -> NFS server + 'nfs-client' default StorageClass.
+# -- NFS storage --
+# NFS server + 'nfs-client' default StorageClass (required by KOF and MSR4 HA).
 nfs_enabled=true
-
-# -- MSR4 / Harbor (t deploy msr4) --
-# true -> enable MSR4 deployment on the running cluster.
-msr4_enabled=false
-
-# Harbor chart version deployed on the cluster.
-# NOTE: airgap_msr_version controls the *bastion* registry (separate).
-msr4_version="4.13.3"
-
-# Replicas for the Harbor Service.
-#   1    -> simple mode: built-in DB + Redis (single pod each)
-#   2+   -> HA mode: external postgres-operator + redis-operator (requires NFS StorageClass)
-msr4_replicas=1
-
-# -- KOF observability (t deploy kof [full|lean] / t deploy kof airgap) --
-# WARNING: requires MKE 4.2.0+ (k0rdent Enterprise 1.3.2). Keep false on MKE < 4.2.0.
-# true  -> KOF auto-deploys at the end of 't deploy lab' / 't deploy lab airgap'.
-# false -> you can still deploy KOF later on the running cluster with
-#          't deploy kof' (online) or 't deploy kof airgap'.
-# Fine-tuning (Grafana, MKE-monitoring reuse, Salesforce) is in "3. Advanced settings".
-kof_enabled=false
-# Deployment scope: full | lean
-#   full = complete observability + FinOps platform
-#   lean = cluster monitoring only (drops tracing + FinOps + dead dashboards)
-# Override per-run with: t deploy kof full | t deploy kof lean
-kof_mode="lean"
 
 # ============================================================
 #  2. Airgap settings   (only for 't deploy lab airgap' / 'mke3-airgap')
 # ============================================================
 
-# Bastion/registry host: needs CPU/RAM for Harbor + skopeo image uploads.
+# Bastion/registry host (runs the MSR4 registry + image uploads).
 airgap_registry_flavor="t3.xlarge"
-
-# Bastion root volume (GB): holds Harbor data + the MKE4k bundle (~15-20 GB).
 airgap_registry_disk_gb=100
 
-# MSR4 (Harbor) offline installer version for the bastion registry.
+# MSR4 offline installer version for the bastion registry.
 # Releases: https://s3-us-east-2.amazonaws.com/packages-mirantis.com/msr/
 airgap_msr_version="v4.13.3"
 
-# Override the bundle download URLs (defaults derive from the versions above).
-# NOTE: airgap bundles exist only for GA versions (e.g. v4.1.1/2/3); RC/dev = online only.
+# Bundle download URL overrides (GA versions only; RC/dev builds are online-only).
 # mke4k_bundle_url=""
 # mke3_bundle_url=""
 
@@ -114,65 +92,41 @@ airgap_msr_version="v4.13.3"
 # ============================================================
 
 # -- Instances --
-# EC2 instance type per role. Controllers run the control plane (also carry the
-# controller+worker role in single-node/HA); workers run your workloads.
-# Minimum recommended for controllers: 4 vCPU / 16 GB.
+# Controllers: at least 4 vCPU / 16 GB.
 controller_flavor="m5a.xlarge"
 worker_flavor="m5a.large"
 
-# Cluster node OS (controllers/workers). Bastion and NFS server always run Ubuntu.
-# os_name:    ubuntu | redhat
-# os_version: MKE4-supported combos - ubuntu: 22.04, 24.04 | redhat: 9.6, 8.10
-#             (other versions are allowed with a warning; the AWS AMI lookup
-#              fails cleanly if no matching image exists)
-os_name="ubuntu"
-os_version="22.04"
-
-# AWS Cloud Controller Manager.
-# true  -> IAM role + policy; required for LoadBalancer services and EBS volumes.
-#          MKE4k: enables cloudProvider in mke4.yaml.
-#          MKE3: adds --cloud-provider=aws install flag to launchpad.yaml.
-# false -> no IAM resources; cloudProvider disabled.
-# (Forced off in airgap modes - no AWS API access from the private subnet.)
-ccm_enabled=false
-
-# true -> mkectl runs with -l debug (very verbose).
+# Verbose mkectl output (-l debug).
 debug=true
 
-# Dry-run the expiry reaper: true -> the reaper Lambda logs what it *would*
-# delete (CloudWatch) but deletes nothing. Use it to verify scope, then unset.
+# true -> the expiry reaper only logs what it would delete.
 expiry_dry_run=false
 
-# -- k0rdent UI gateway (used when k0rdent_ui_enabled=true) --
-# NodePort the Envoy gateway is pinned to (MKE4k range 32768-35535; 33001/33002/33443 taken).
+# -- k0rdent UI gateway --
+# Envoy NodePort (range 32768-35535) and NLB listener port.
 k0rdent_ui_nodeport=33003
-# NLB listener port. Online: https://<nlb-dns>:<lb_port>. Airgap: t tunnel k0rdent-ui.
 k0rdent_ui_lb_port=8445
 
-# -- MKE4k child cluster (used by 't deploy child-cluster') --
-# AWS region for the child (empty = same as 'region').
+# -- MKE4k child cluster --
+# Dex 'admin' login for the child UI -> terraform/child_credentials.txt.
+child_admin_enabled=true
+# SSH via a bastion locked to your public IP ('t connect m1-child').
+# Set before creating the child: the SSH key can't be added later.
+child_ssh_enabled=true
+# Bastion SSH source (empty = your public IP/32).
+child_ssh_allowed_cidr=""
+# Child region (empty = same as 'region'; SSH needs the same region).
 child_region=""
-# EC2 instance types (empty = the mke4k-aws cluster template's defaults:
-# m5.xlarge control plane / m5.large workers). Rendered into
-# spec.infrastructure.configuration.{controlPlane,worker}.instanceType.
-# The child's MKE4k version always equals mke4k_version (must match the management cluster).
+# Instance types (empty = template defaults: m5.xlarge / m5.large).
 child_control_plane_flavor=""
 child_worker_flavor=""
-# Max availability zones the child's CAPA VPC spans.
 child_az_limit=1
-# CIDR allowed to SSH to the child bastion (empty = this host's public IP/32,
-# auto-detected; re-run 't deploy child-cluster' after your IP changes).
-child_ssh_allowed_cidr=""
-# How long to wait for the child to become Ready / to be deleted (s|m|h).
 child_ready_timeout="30m"
 child_delete_timeout="30m"
 
 # -- MKE3 --
-# launchpad binary is auto-downloaded on first use.
-# Releases: https://github.com/Mirantis/launchpad/releases
 launchpad_version="1.5.15"
-
-# Admin username for the MKE3 UI (password auto-generated -> terraform/mke3_credentials.txt).
+# MKE3 UI admin (password -> terraform/mke3_credentials.txt).
 mke3_admin_username="admin"
 
 # -- NFS server --
@@ -180,65 +134,33 @@ nfs_flavor="t3.small"
 nfs_disk_gb=150
 nfs_export_path="/srv/nfs/data"
 
-# -- MSR4 HA (used when msr4_replicas >= 2) --
+# -- MSR4 HA (msr4_replicas >= 2) --
 msr4_postgres_version="1.15.1"
 msr4_redis_operator_version="0.24.0"
 msr4_redis_replication_version="0.16.13"
-# PVC size for the MSR4 registry volume. Requires nfs_enabled=true.
 msr4_storage_size="10Gi"
 
-# -- KOF (used by 't deploy kof') --
-# Helm umbrella-chart version — must match the cluster's k0rdent Enterprise
-# release ('kubectl get mgmt' → RELEASE). The ONLY tested and validated
-# combinations are:
-#   1.8.1 = k0rdent Enterprise 1.3.2 / MKE 4.2.0
-#   1.4.1 = k0rdent Enterprise 1.4.1 / MKE 4.2.1 (gets kof/version-overrides/1.4.yaml)
-# Any other KOF version is untested: the charts change between releases in
-# ways that silently break the M2M setup (see CLAUDE.md "KOF values layering").
-kof_version="1.8.1"
-# PVC size for VictoriaMetrics / VictoriaLogs / VictoriaTraces (doc default 100Gi),
-# and on KOF 1.4.x also the audit-logs VictoriaLogs cluster (chart default 2 x 100Gi).
+# -- KOF --
+# PVC size for the VictoriaMetrics / Logs / Traces volumes.
 kof_storage_size="10Gi"
-# Image/chart registry. Leave default: in airgap it is auto-derived to
-# <registry_hostname>/mke (where the MKE bundle upload lands the KOF artifacts).
-# Override only to point at a different custom registry.
+# Image/chart registry (auto-derived in airgap).
 kof_registry="registry.mirantis.com/k0rdent-enterprise"
-# Deploy Grafana (grafana-operator + datasources/dashboards + pinned instance CR).
-# Mirantis no longer ships Grafana with KOF by default — this adds it back.
+# Grafana, exposed over HTTPS on the NLB (airgap: 't tunnel grafana').
 kof_grafana_enabled=true
-# Grafana image tag in <kof_registry>/grafana/grafana (registry ships 11.0.0).
 kof_grafana_image_tag="11.0.0"
-# Expose Grafana over HTTPS via a dedicated Envoy gateway.
-# Online: adds an NLB listener + SG rule (t deploy kof runs terraform apply) ->
-# https://<nlb-dns>:<kof_grafana_lb_port>. Airgap: auto-enabled regardless of this
-# flag (only path to Grafana); access via 't tunnel grafana'.
 kof_grafana_gateway_enabled=true
-# Grafana gateway NodePort (MKE4k range 32768-35535).
 kof_grafana_nodeport=33002
-# NLB listener port for Grafana (TCP pass-through; gateway terminates TLS).
-# In airgap this is the LOCAL port of 't tunnel grafana' (https://localhost:<port>).
 kof_grafana_lb_port=8443
-# Reuse MKE4's built-in monitoring instead of duplicating it: drops KOF's own
-# node-exporter + kube-proxy/coredns/apiserver scrapes (KOF already scrapes MKE's,
-# same labels), makes KOF's kube-state-metrics custom-resource-only (MKE serves the
-# standard kube_* metrics), and adds MKE's Prometheus as a Grafana datasource.
-# Default on; set false to run KOF's full scrape set alongside MKE's.
+# Reuse MKE's built-in monitoring instead of duplicating it.
 kof_reuse_mke_monitoring=true
-# Sub-option (only applies when reuse is on): also drop KOF's duplicate
-# kubelet/cAdvisor scrape so MKE's kubelet ServiceMonitor is the single source.
-# Without this, pod CPU/memory on sum-by-pod dashboards over-report ~2x. On by
-# default; set false to keep KOF's richer cAdvisor series set (accepting the 2x).
+# Also drop KOF's duplicate kubelet scrape (avoids 2x pod CPU/memory).
 kof_reuse_mke_kubelet=true
-# Route alerts with severity critical|warning|error to the sf-notifier webhook
-# (http://sf-notifier:5000/hook); info/none are dropped. sf-notifier itself is
-# deployed separately by hand — leave false unless it is running, otherwise
-# Alertmanager logs failed deliveries and fires AlertmanagerFailedToSendAlerts.
+# Route alerts to sf-notifier (deploy sf-notifier separately first).
 kof_sf_notifier_enabled=false
-# Namespace where k0rdent (KCM) runs (MKE4k uses "k0rdent", upstream default "kcm-system").
+# Namespace where k0rdent runs.
 kof_kcm_namespace="k0rdent"
-# Keep VictoriaMetrics/VictoriaLogs in HA (cluster) topology. Applies to both modes.
+# HA topology for VictoriaMetrics / VictoriaLogs.
 kof_storage_ha=true
-# Lean-mode dashboard prune lists. Folders are comma-separated (names contain spaces);
-# the Grafana folder names come from the kof-dashboards subchart directory layout.
+# Lean-mode Grafana prune lists (comma-separated).
 kof_lean_prune_folders="Istio,Opencost,Victoria Traces"
 kof_lean_prune_dashboards="kps-nodes-aix,kps-nodes-darwin"

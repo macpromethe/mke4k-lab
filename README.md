@@ -443,7 +443,7 @@ Re-running it is safe: every step is idempotent, so it also resumes a deploy tha
 - **UI:** the child's `EXTERNAL ADDRESS` (`https://<elb>:30001`, self-signed). MKE4k creates no Dex admin user on child clusters, so with `child_admin_enabled=true` (default) the deploy creates one the same way `mkectl` does on a standalone cluster: a Dex `Password` object (`admin`, bcrypt hash only) in the child's `mke` namespace, plus a copy of the management cluster's ClusterRoleBindings for its own admin (`mke4k-lab-child-admin-*`; without it the login works but shows nothing). The password is saved to `terraform/child_credentials.txt` (chmod 600).
 - `t show summary` includes a *Child cluster* section — live status/version, UI URL, login, kubeconfig — while a child exists.
 
-**SSH (optional, `child_ssh_enabled=true`)**
+**SSH (`child_ssh_enabled=true`, default)**
 - The child's nodes have no public IPs, and CAPA only lets SSH into them from its own bastion — so SSH means a CAPA **bastion** in the child VPC's public subnet (`t2.micro`), allowed only from your public IP (`/32`, auto-detected via `checkip.amazonaws.com`, or `child_ssh_allowed_cidr`). The nodes keep `publicIP: false`.
 - The machines get the lab's own EC2 key pair (`<cluster_name>-key` / `terraform/aws_private.pem`), so the child must be in the lab's region.
 - `t connect m1-child` / `w1-child` (control-plane / worker, 1-based by node name) jump through the bastion as `ec2-user` (Amazon Linux 2023); `t connect child-bastion` opens the bastion itself. `t connect m1-child "cmd"` runs one command.
@@ -728,7 +728,7 @@ t destroy lab
 
 The child's MKE4k version is not configurable: `MkeChildConfig` `spec.version` always equals the deployed `mke4k_version` (`vX.Y.Z` — the docs require it to match the management cluster). The preflight also warns when the region lacks Elastic IP quota (CAPA needs one per AZ).
 | `child_ready_timeout` / `child_delete_timeout` | `30m` | How long to wait for Ready / deletion |
-| `child_ssh_enabled` | `false` | SSH into child nodes via a CAPA bastion (`t connect m1-child`); set before creating the child |
+| `child_ssh_enabled` | `true` | SSH into child nodes via a CAPA bastion (`t connect m1-child`); set before creating the child. `false` = no bastion, no key |
 | `child_ssh_allowed_cidr` | *(your public IP/32)* | CIDR allowed to reach the child bastion |
 | `child_admin_enabled` | `true` | Create a Dex `admin` login + RBAC for the child UI (password → `terraform/child_credentials.txt`) |
 
