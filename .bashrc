@@ -64,3 +64,28 @@ complete -C /usr/local/bin/terraform terraform 2>/dev/null || true
 [[ -f "${HOME}/.mke/mke.kubeconf" ]] && export KUBECONFIG="${HOME}/.mke/mke.kubeconf"
 
 [[ -f /etc/motd ]] && cat /etc/motd
+
+# One-line status of the lab in this container (local state only — no AWS or
+# terraform calls, so the shell starts instantly).
+_mke4k_lab_status() {
+    local root=/mke4k-lab state=/mke4k-lab/terraform/terraform.tfstate name mode
+    [[ -s "${state}" ]] && command -v jq >/dev/null 2>&1 || return 0
+    [[ "$(jq '[.resources[]?] | length' "${state}" 2>/dev/null)" -gt 0 ]] 2>/dev/null || return 0
+    # Same rule as load_config: the bare default name gets the .cluster-id suffix.
+    name="${cluster_name:-mke4k-lab}"
+    [[ "${name}" == "mke4k-lab" && -s "${root}/.cluster-id" ]] && name+="-$(cat "${root}/.cluster-id")"
+    if [[ -n "$(jq -r '.outputs.mke3_lb_dns_name.value // empty' "${state}" 2>/dev/null)" ]]; then
+        mode="MKE3"
+    else
+        mode="MKE4k"
+    fi
+    if [[ -n "$(jq -r '.outputs.bastion_public_ip.value // empty' "${state}" 2>/dev/null)" ]]; then
+        mode+=" airgap"
+    else
+        mode+=" online"
+    fi
+    [[ -f "${root}/.child-cluster" ]] && mode+=", + child cluster"
+    printf '  Lab: %s (%s) — t show summary\n\n' "${name}" "${mode}"
+}
+_mke4k_lab_status
+unset -f _mke4k_lab_status

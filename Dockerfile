@@ -104,9 +104,8 @@ COPY . /mke4k-lab
 # Install t CLI
 RUN ln -sf /mke4k-lab/bin/t-commandline.bash /usr/local/bin/t
 
-# Set MOTD
-RUN printf '\n  Welcome to mke4k-lab\n-------------------------------\n  Tools ready: terraform, kubectl, helm, aws, k9s\n  mkectl is downloaded on first use (version from config)\n  Edit /mke4k-lab/config then run: t deploy lab\n\n' \
-    > /etc/motd
+# Welcome message (shown by .bashrc)
+COPY motd /etc/motd
 
 # Bash config (already landed via COPY . above; move to /root)
 RUN mv /mke4k-lab/.bashrc /root/.bashrc

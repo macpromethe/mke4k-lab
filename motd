@@ -1,0 +1,30 @@
+
+  mke4k-lab  —  MKE4k / MKE3 labs on AWS
+  ──────────────────────────────────────────────────────────────
+
+  0. AWS credentials (skip if you passed them with 'docker run -e'):
+
+     export AWS_ACCESS_KEY_ID="..."
+     export AWS_SECRET_ACCESS_KEY="..."
+     export AWS_SESSION_TOKEN="..."      # temporary credentials only
+
+  1. Edit /mke4k-lab/config (version, node counts, add-ons)
+  2. Deploy:
+
+     t deploy lab                MKE4k (online)
+     t deploy lab airgap         MKE4k, airgapped (bastion + MSR4 registry)
+     t deploy lab mke3           MKE3 (upgrade testing)
+     t deploy lab mke3-airgap    MKE3, airgapped
+
+  Add-ons (on a running lab):
+     t deploy nfs                NFS StorageClass
+     t deploy msr4               MSR4 registry on the cluster
+     t deploy kof                KOF observability (MKE 4.2+)
+     t deploy k0rdent-ui         k0rdent UI over HTTPS
+     t deploy child-cluster      MKE4k child cluster via k0rdent (AWS)
+
+  Day-2:   t status · t show summary · t connect m1 · t config edit
+  Cleanup: t destroy lab  (auto-expires after expiry_days)
+
+  All commands: t help
+  Tools: terraform, kubectl, helm, aws, k9s (mkectl downloads on first use)
