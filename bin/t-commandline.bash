@@ -241,6 +241,32 @@ load_config() {
     k0rdent_ui_enabled="${k0rdent_ui_enabled:-false}"
     k0rdent_ui_nodeport="${k0rdent_ui_nodeport:-33003}"
     k0rdent_ui_lb_port="${k0rdent_ui_lb_port:-8445}"
+
+    # MKE4k child cluster defaults (one child per lab, named after the lab so
+    # its CAPA VPC/ELB names can't collide with another user's child).
+    child_name="${cluster_name}-child"
+    child_control_plane_count="${child_control_plane_count:-1}"
+    child_worker_count="${child_worker_count:-1}"
+    child_region="${child_region:-${region}}"
+    # MkeChildConfig spec.version must match the management cluster's version,
+    # in vX.Y.Z form (official docs) — i.e. mke4k_version verbatim.
+    child_version="${mke4k_version}"
+    child_az_limit="${child_az_limit:-1}"
+    child_control_plane_flavor="${child_control_plane_flavor:-}"
+    child_worker_flavor="${child_worker_flavor:-}"
+    child_ready_timeout="${child_ready_timeout:-30m}"
+    child_delete_timeout="${child_delete_timeout:-30m}"
+    child_admin_enabled="${child_admin_enabled:-true}"
+    child_ssh_enabled="${child_ssh_enabled:-false}"
+    child_ssh_allowed_cidr="${child_ssh_allowed_cidr:-}"
+    if [[ -n "${child_ssh_allowed_cidr}" ]]; then
+        [[ "${child_ssh_allowed_cidr}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] \
+            || die "child_ssh_allowed_cidr must be an IPv4 CIDR like 203.0.113.7/32 (got: ${child_ssh_allowed_cidr})"
+    fi
+    [[ "${child_control_plane_count}" =~ ^[1-9][0-9]*$ && $(( child_control_plane_count % 2 )) -eq 1 ]] \
+        || die "child_control_plane_count must be an odd integer >= 1 (got: ${child_control_plane_count})"
+    [[ "${child_worker_count}" =~ ^[0-9]+$ ]] || die "child_worker_count must be a non-negative integer (got: ${child_worker_count})"
+    [[ "${child_az_limit}" =~ ^[1-9][0-9]*$ ]] || die "child_az_limit must be an integer >= 1 (got: ${child_az_limit})"
 }
 
 msr4_credentials_file() {
@@ -2978,6 +3004,8 @@ ${BOLD}Node names:${RESET}
   nfs                NFS server (when nfs_enabled=true)
   m1, m2, m3, …     controllers (managers)
   w1, w2, w3, …     workers
+  m1-child, w1-child child cluster nodes (child_ssh_enabled=true)
+  child-bastion      child cluster bastion
   <ip>               any raw IP or hostname
 
 ${BOLD}Examples:${RESET}
@@ -2989,6 +3017,14 @@ ${BOLD}Examples:${RESET}
 EOF
         return 0
     fi
+
+    # Child cluster nodes (via the child's CAPA bastion)
+    case "${target}" in
+        m[0-9]*-child|w[0-9]*-child|child-bastion)
+            cmd_connect_child "${target}" "${remote_cmd}"
+            return
+            ;;
+    esac
 
     local ssh_key="${TERRAFORM_DIR}/aws_private.pem"
     [[ -f "${ssh_key}" ]] \
@@ -3132,6 +3168,54 @@ print_deploy_summary() {
             bline "    Reusing MKE monitoring (no KOF node-exporter)"
             bline "    + MKE Prometheus datasource in Grafana"
         fi
+    fi
+    if [[ -f "$(child_marker_file)" ]]; then
+        local cname cjson cready="?" cver="?" caddr="" ccreds
+        cname="$(cat "$(child_marker_file)")"
+        ccreds="$(child_credentials_file)"
+        cjson="$(kubectl -n "${kof_kcm_namespace:-k0rdent}" get mkechildconfig "${cname}" \
+            -o json --request-timeout=10s 2>/dev/null || true)"
+        if [[ -n "${cjson}" ]]; then
+            cready="$(jq -r '[.status.conditions[]? | select(.type == "Ready") | .status][0] // "?"' <<<"${cjson}")"
+            cver="$(jq -r '.spec.version // "?"' <<<"${cjson}")"
+            caddr="$(jq -r '[.. | objects | .externalAddress? | select(type == "string" and . != "")][0] // empty' <<<"${cjson}")"
+            if [[ "${cready}" == "?" ]]; then
+                # Same source as child_wait_ready: the CRD's READY printer column.
+                local rpath; rpath="$(_child_printer_path READY)"
+                [[ -n "${rpath}" ]] && cready="$(kubectl -n "${kof_kcm_namespace:-k0rdent}" get mkechildconfig "${cname}" \
+                    --no-headers -o "custom-columns=R:{${rpath}}" --request-timeout=10s 2>/dev/null || echo '?')"
+            fi
+        fi
+        sep
+        bline "  Child cluster (k0rdent / CAPI on AWS)"
+        bline "$(printf '    %-12s %s' 'Name' "${cname}")"
+        if [[ -n "${cjson}" ]]; then
+            bline "$(printf '    %-12s Ready=%s  version=%s' 'Status' "${cready}" "${cver}")"
+        else
+            bline "$(printf '    %-12s %s' 'Status' '(management cluster unreachable)')"
+        fi
+        if [[ -n "${caddr}" ]]; then
+            bline "    UI (HTTPS, self-signed):"
+            local cchunk=$(( W - 6 )) curl_rem="${caddr}"
+            while [[ ${#curl_rem} -gt ${cchunk} ]]; do
+                bline "      ${curl_rem:0:${cchunk}}"
+                curl_rem="${curl_rem:${cchunk}}"
+            done
+            bline "      ${curl_rem}"
+        fi
+        if [[ -f "${ccreds}" ]]; then
+            bline "$(printf '    %-12s %s' 'Username' "$(grep '^username=' "${ccreds}" | cut -d= -f2)")"
+            bline "$(printf '    %-12s %s' 'Password' "$(grep '^password=' "${ccreds}" | cut -d= -f2)")"
+        fi
+        bline "$(printf '    %-12s %s' 'Kubeconfig' 'terraform/child.kubeconfig')"
+        if [[ -n "${cjson}" ]]; then
+            local cbip; cbip="$(_child_bastion_ip)"
+            if [[ -n "${cbip}" ]]; then
+                bline "$(printf '    %-12s %s' 'Bastion' "${cbip}")"
+                bline "    t connect m1-child | w1-child | child-bastion"
+            fi
+        fi
+        bline "    t status child  |  t destroy child-cluster"
     fi
     sep
     bline "  kubectl get nodes"
@@ -3539,6 +3623,7 @@ cmd_deploy_cluster_mke3() {
 
 cmd_destroy_cluster() {
     load_config
+    child_destroy_before_teardown
     mkectl_reset
 }
 
@@ -3754,10 +3839,13 @@ cmd_destroy_cluster_mke3_airgap() {
 
 cmd_destroy_lab() {
     load_config
+    # CAPA-owned child clusters must go while the management cluster still runs.
+    child_destroy_before_teardown
     write_tfvars
     tf_destroy
     # Clear any 't expiry' override so a future lab starts from config defaults.
     rm -f "${PROJECT_ROOT}/.expiry-days" "${PROJECT_ROOT}/.expiry-base"
+    rm -f "$(child_marker_file)" "$(child_kubeconfig_file)" "$(child_credentials_file)"
     success "Lab destroyed."
 }
 
@@ -5307,6 +5395,751 @@ cmd_destroy_k0rdent_ui() {
 }
 
 # ---------------------------------------------------------------------------
+# MKE4k child cluster — k0rdent / CAPI (CAPA) on AWS
+# ---------------------------------------------------------------------------
+# Follows https://docs.mirantis.com/mke4/4.2.0/tutorials/deploy-mke4-child-cluster/aws/:
+#   1. enable the CAPA + k0smotron providers on Management/kcm
+#   2. AWS identity: Secret + AWSClusterStaticIdentity + Credential + resource-template CM
+#   3. MkeChildConfig -> k0rdent provisions the child in its own CAPA VPC
+#   4. wait for READY, pull <name>-kubeconfig -> terraform/child.kubeconfig
+# Online MKE4k only (CAPA needs the AWS API). One child per lab: <cluster_name>-child,
+# so CAPA's VPC/ELB names can't collide with another user's child.
+# The identity reuses the container's AWS credentials (CHILD_AWS_ACCESS_KEY_ID /
+# CHILD_AWS_SECRET_ACCESS_KEY override them); no IAM user is created.
+# The child's AWS resources belong to CAPA, not terraform, so the child must be
+# deleted while the CAPA controllers still run: 't destroy lab' / 't destroy
+# cluster' call child_destroy_before_teardown first. The expiry reaper does NOT
+# cover child clusters.
+# ---------------------------------------------------------------------------
+
+CHILD_PROVIDERS=(cluster-api-provider-aws cluster-api-provider-k0sproject-k0smotron)
+CHILD_CRD="mkechildconfigs.mke.mirantis.com"
+CHILD_CAPA_TAG_PREFIX="sigs.k8s.io/cluster-api-provider-aws/cluster"
+
+child_kubeconfig_file() { printf '%s\n' "${TERRAFORM_DIR}/child.kubeconfig"; }
+child_marker_file()     { printf '%s\n' "${PROJECT_ROOT}/.child-cluster"; }
+
+# -- Child SSH (optional, child_ssh_enabled) ------------------------------------
+# The child's nodes stay private (publicIP=false); CAPA only allows SSH into them
+# from its bastion's security group, so SSH = a CAPA bastion in the child's public
+# subnet, locked to this host's public IP. Machines get the lab's own EC2 key pair
+# (${cluster_name}-key / terraform/aws_private.pem) — fixed at child creation.
+# Nodes run Amazon Linux 2023 (template imageLookup) -> ec2-user.
+CHILD_NODE_SSH_USER="ec2-user"
+
+# CIDR allowed to reach the bastion: child_ssh_allowed_cidr, else this host's
+# public IPv4 as /32.
+_child_ssh_cidr() {
+    if [[ -n "${child_ssh_allowed_cidr}" ]]; then
+        printf '%s\n' "${child_ssh_allowed_cidr}"
+        return 0
+    fi
+    local ip
+    ip="$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')"
+    [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    printf '%s/32\n' "${ip}"
+}
+
+# Public IP of the child's CAPA bastion (empty when it has none).
+_child_bastion_ip() {
+    kubectl -n "${kof_kcm_namespace}" get awsclusters.infrastructure.cluster.x-k8s.io \
+        -l "cluster.x-k8s.io/cluster-name=${child_name}" --request-timeout=10s \
+        -o jsonpath='{.items[0].status.bastion.publicIp}' 2>/dev/null || true
+}
+
+# SSH user of the bastion (CAPA's default bastion AMI is Ubuntu; a custom one may
+# be Amazon Linux) — the first that accepts the lab key.
+_child_bastion_user() {
+    local bip="$1" key="$2" u
+    for u in ubuntu ec2-user; do
+        ssh -q -i "${key}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o BatchMode=yes -o ConnectTimeout=10 "${u}@${bip}" true </dev/null 2>/dev/null \
+            && { printf '%s\n' "${u}"; return 0; }
+    done
+    return 1
+}
+
+# Internal IP of the <idx>-th (1-based, by node name) control-plane (m) or worker (w) node.
+_child_node_ip() {
+    local role="$1" idx="$2" sel='node-role.kubernetes.io/control-plane'
+    [[ "${role}" == "w" ]] && sel='!node-role.kubernetes.io/control-plane'
+    kubectl --kubeconfig="$(child_kubeconfig_file)" get nodes -l "${sel}" --sort-by=.metadata.name \
+        --request-timeout=15s \
+        -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' 2>/dev/null \
+        | sed -n "${idx}p"
+}
+
+# t connect m<N>-child | w<N>-child | child-bastion [command]
+cmd_connect_child() {
+    local target="$1" remote_cmd="$2"
+    load_config
+    local key="${TERRAFORM_DIR}/aws_private.pem" bip user ip
+    [[ -f "${key}" ]] || die "SSH key not found at ${key}. Has terraform been applied?"
+    [[ -f "$(child_marker_file)" ]] || die "No child cluster deployed ('t deploy child-cluster')."
+
+    bip="$(_child_bastion_ip)"
+    if [[ -z "${bip}" ]]; then
+        error "The child cluster has no bastion, so its private nodes can't be reached over SSH."
+        echo "  Enable it: child_ssh_enabled=true in config, then 't destroy child-cluster' + 't deploy child-cluster'" >&2
+        echo "  (the SSH key can only be set when the child is created)." >&2
+        echo "  Shell without SSH: kubectl --kubeconfig $(child_kubeconfig_file) debug node/<node> -it --image=busybox -- chroot /host sh" >&2
+        exit 1
+    fi
+    user="$(_child_bastion_user "${bip}" "${key}")" \
+        || die "Cannot SSH to the child bastion ${bip}. If your public IP changed, re-run 't deploy child-cluster' to update its allowed CIDR."
+
+    local -a opts=(-q -i "${key}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+    if [[ "${target}" == "child-bastion" ]]; then
+        ip="${bip}"
+        opts+=(-l "${user}")
+    else
+        local role="${target:0:1}" idx="${target:1}"
+        idx="${idx%-child}"
+        ip="$(_child_node_ip "${role}" "${idx}")"
+        [[ -n "${ip}" ]] || die "Child node ${target} not found ('t status child' lists the nodes)."
+        opts+=(-l "${CHILD_NODE_SSH_USER}"
+               -o "ProxyCommand=ssh -q -i ${key} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W %h:%p ${user}@${bip}")
+    fi
+
+    if [[ -n "${remote_cmd}" ]]; then
+        info "Running command on ${target} (${ip})..."
+        ssh "${opts[@]}" "${ip}" "${remote_cmd}"
+    else
+        info "Connecting to ${target} (${ip})..."
+        ssh "${opts[@]}" "${ip}"
+    fi
+}
+
+# "30m" / "600s" / "1h" / "90" -> seconds
+_duration_to_seconds() {
+    case "$1" in
+        *s) echo "${1%s}" ;;
+        *m) echo $(( ${1%m} * 60 )) ;;
+        *h) echo $(( ${1%h} * 3600 )) ;;
+        *)  echo "$1" ;;
+    esac
+}
+
+# Succeeds when the terraform output describes an online MKE4k lab
+# (provisioned, no bastion, no MKE3 NLB).
+_child_lab_supported() {
+    local output="$1"
+    [[ -n "$(jq -r '.lb_dns_name.value // empty' <<<"${output}" 2>/dev/null)" ]] || return 1
+    [[ "$(detect_deploy_mode "${output}")" == "online" ]] || return 1
+    [[ -z "$(jq -r '.mke3_lb_dns_name.value // empty' <<<"${output}" 2>/dev/null)" ]]
+}
+
+# AWS credentials for the CAPA identity: CHILD_AWS_* override the container's.
+_child_aws_creds() {
+    if [[ -n "${CHILD_AWS_ACCESS_KEY_ID:-}" ]]; then
+        _child_key="${CHILD_AWS_ACCESS_KEY_ID}"
+        _child_secret="${CHILD_AWS_SECRET_ACCESS_KEY:-}"
+        _child_token="${CHILD_AWS_SESSION_TOKEN:-}"
+    else
+        _child_key="${AWS_ACCESS_KEY_ID:-}"
+        _child_secret="${AWS_SECRET_ACCESS_KEY:-}"
+        _child_token="${AWS_SESSION_TOKEN:-}"
+    fi
+}
+
+# VPC IDs CAPA created for the child (tag key sigs.k8s.io/.../cluster/<name>*).
+_child_capa_vpcs() {
+    aws ec2 describe-vpcs --region "${child_region}" \
+        --filters "Name=tag-key,Values=${CHILD_CAPA_TAG_PREFIX}/${child_name}*" \
+        --query 'Vpcs[].VpcId' --output text 2>/dev/null | sed 's/None//' | xargs
+}
+
+child_preflight() {
+    local output tool p ns="${kof_kcm_namespace}"
+    output="$(tf_output 2>/dev/null || true)"
+    _child_lab_supported "${output}" \
+        || die "Child clusters need a deployed online MKE4k lab (not airgap / MKE3). Run 't deploy lab' first."
+    for tool in kubectl jq yq aws; do
+        command -v "${tool}" >/dev/null 2>&1 || die "Child cluster deploy requires '${tool}' in PATH."
+    done
+    for p in aws-identity.yaml mkechildconfig.yaml; do
+        [[ -f "${PROJECT_ROOT}/child-cluster/${p}" ]] || die "Missing committed asset ${PROJECT_ROOT}/child-cluster/${p}."
+    done
+    [[ -f "${KUBECONFIG}" ]] || die "Kubeconfig not found at ${KUBECONFIG}. Has the cluster been deployed?"
+    kubectl get nodes --request-timeout=20s >/dev/null 2>&1 || die "Cluster not reachable. Deploy MKE4k first."
+    kubectl get management kcm >/dev/null 2>&1 \
+        || die "Management object 'kcm' not found — is this an MKE4k (k0rdent Enterprise) cluster?"
+    kubectl get crd "${CHILD_CRD}" >/dev/null 2>&1 \
+        || die "CRD ${CHILD_CRD} not found — this MKE4k version does not support child clusters."
+    kubectl get ns "${ns}" >/dev/null 2>&1 \
+        || die "k0rdent (KCM) namespace '${ns}' not found. Set kof_kcm_namespace in config (check 'kubectl get ns')."
+
+    _child_aws_creds
+    [[ -n "${_child_key}" && -n "${_child_secret}" ]] \
+        || die "AWS credentials not set. Export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or CHILD_AWS_ACCESS_KEY_ID/CHILD_AWS_SECRET_ACCESS_KEY)."
+    if [[ -n "${_child_token}" ]]; then
+        warn "Temporary AWS credentials (session token) detected. CAPA keeps using them for the child's"
+        warn "lifetime: once they expire, export fresh ones and run 't rotate child-creds' (the destroy"
+        warn "commands sync them automatically)."
+    fi
+
+    # The mke4k-aws cluster template puts control-plane AND worker machines on this
+    # instance profile (from the account's clusterawsadm bootstrap stack); without
+    # it machines fail to launch.
+    aws iam get-instance-profile --instance-profile-name control-plane.cluster-api-provider-aws.sigs.k8s.io >/dev/null 2>&1 \
+        || warn "IAM instance profile control-plane.cluster-api-provider-aws.sigs.k8s.io not found (or not readable) — child machines may fail to launch."
+
+    # CAPA allocates one Elastic IP (NAT gateway) per AZ the child spans.
+    local eip_used eip_quota
+    eip_used="$(aws ec2 describe-addresses --region "${child_region}" --query 'length(Addresses)' --output text 2>/dev/null || true)"
+    eip_quota="$(aws service-quotas get-service-quota --region "${child_region}" --service-code ec2 \
+        --quota-code L-0263D0A3 --query 'Quota.Value' --output text 2>/dev/null || true)"
+    eip_quota="${eip_quota%%.*}"
+    if [[ "${eip_used}" =~ ^[0-9]+$ && "${eip_quota}" =~ ^[0-9]+$ ]] \
+        && (( eip_used + child_az_limit > eip_quota )); then
+        warn "Elastic IPs in ${child_region}: ${eip_used} of ${eip_quota} used; the child needs ${child_az_limit} more (one per AZ) — CAPA will fail to create NAT gateways."
+    fi
+
+    if [[ "${child_ssh_enabled}" == "true" ]]; then
+        [[ "${child_region}" == "${region}" ]] \
+            || die "child_ssh_enabled reuses the lab's EC2 key pair ${cluster_name}-key, which only exists in ${region}. Set child_region=${region} or child_ssh_enabled=false."
+        [[ -f "${TERRAFORM_DIR}/aws_private.pem" ]] || die "SSH key ${TERRAFORM_DIR}/aws_private.pem not found."
+        aws ec2 describe-key-pairs --region "${region}" --key-names "${cluster_name}-key" >/dev/null 2>&1 \
+            || die "EC2 key pair ${cluster_name}-key not found in ${region}."
+        _child_cidr="$(_child_ssh_cidr)" \
+            || die "Could not detect this host's public IP (checkip.amazonaws.com). Set child_ssh_allowed_cidr in config."
+        [[ "${_child_cidr}" == "0.0.0.0/0" ]] && warn "child_ssh_allowed_cidr=0.0.0.0/0 opens the child bastion's SSH port to the whole internet."
+        info "Child SSH: bastion allowed from ${_child_cidr}, key ${cluster_name}-key"
+    fi
+
+    # A CAPA VPC for this name that we didn't create (no MkeChildConfig) is a
+    # leftover that would collide with the new child's resources.
+    if ! kubectl -n "${ns}" get mkechildconfig "${child_name}" >/dev/null 2>&1; then
+        local vpcs
+        vpcs="$(_child_capa_vpcs)"
+        [[ -z "${vpcs}" ]] \
+            || die "CAPA VPC(s) for '${child_name}' already exist in ${child_region} (${vpcs}) with no MkeChildConfig — leftovers from a previous child. Delete them first."
+    fi
+}
+
+# Add the CAPA + k0smotron providers to Management/kcm (only the missing ones —
+# a blind JSON-patch 'add' would duplicate entries on re-runs), then wait for
+# them to report success in the Management status.
+child_enable_providers() {
+    local mgmt have p patch ready i
+    mgmt="$(kubectl get management kcm -o json)" || die "Failed to read Management/kcm."
+    have="$(jq -r '.spec.providers[]?.name' <<<"${mgmt}")"
+    local -a missing=()
+    for p in "${CHILD_PROVIDERS[@]}"; do
+        grep -qxF "${p}" <<<"${have}" || missing+=("${p}")
+    done
+
+    if (( ${#missing[@]} )); then
+        info "Enabling CAPI providers on Management/kcm: ${missing[*]}"
+        if [[ "$(jq '.spec.providers == null' <<<"${mgmt}")" == "true" ]]; then
+            patch="$(printf '%s\n' "${missing[@]}" | jq -R '{name: .}' | jq -sc '[{op: "add", path: "/spec/providers", value: .}]')"
+        else
+            patch="$(printf '%s\n' "${missing[@]}" | jq -R '{op: "add", path: "/spec/providers/-", value: {name: .}}' | jq -sc .)"
+        fi
+        kubectl patch management kcm --type=json -p "${patch}" >/dev/null || die "Failed to patch Management/kcm."
+    else
+        info "CAPI providers already enabled: ${CHILD_PROVIDERS[*]}"
+    fi
+
+    # Component keys may carry a template suffix, so match by prefix.
+    local want; want="$(printf '%s\n' "${CHILD_PROVIDERS[@]}" | jq -R . | jq -sc .)"
+    info "Waiting for the providers to become ready (up to 15m)..."
+    for (( i = 1; i <= 90; i++ )); do
+        ready="$(kubectl get management kcm -o json 2>/dev/null | jq -r --argjson want "${want}" '
+            (.status.components // {} | to_entries) as $c
+            | [ $want[] as $p | [ $c[] | select(.key | startswith($p)) ] as $m
+                | ($m | length > 0) and ($m | all(.value.success == true)) ]
+            | all' 2>/dev/null || echo false)"
+        if [[ "${ready}" == "true" ]]; then
+            info "  providers ready"
+            return 0
+        fi
+        (( i % 6 == 1 )) && echo "  [$(( (i - 1) * 10 ))s] waiting for ${CHILD_PROVIDERS[*]} in Management/kcm status..."
+        sleep 10
+    done
+    warn "Providers not reported ready in Management/kcm status after 15m — continuing."
+    warn "Check 'kubectl get management kcm -o yaml' (.status.components) if the next steps fail."
+}
+
+# Secret + AWSClusterStaticIdentity + Credential + resource-template ConfigMap.
+# Write the current AWS credentials (_child_aws_creds) into the identity secret.
+# CAPA re-reads it on every reconcile (its session cache is keyed by a hash of the
+# credentials), so an in-place update takes effect without restarting CAPA.
+# 'apply' prunes keys from the previous apply, so moving from temporary to
+# long-lived keys also drops a stale SessionToken.
+_child_apply_identity_secret() {
+    local ns="${kof_kcm_namespace}"
+    _child_aws_creds
+    # Keys go through a process-substitution env file: never in argv or on disk.
+    kubectl -n "${ns}" create secret generic aws-cluster-identity-secret \
+        --from-env-file=<(
+            printf 'AccessKeyID=%s\nSecretAccessKey=%s\n' "${_child_key}" "${_child_secret}"
+            if [[ -n "${_child_token}" ]]; then printf 'SessionToken=%s\n' "${_child_token}"; fi
+        ) --dry-run=client -o yaml \
+        | kubectl label --local -f - k0rdent.mirantis.com/component=kcm -o yaml \
+        | kubectl apply -f - >/dev/null
+}
+
+# Succeeds when the current child credentials authenticate against AWS.
+_child_creds_valid() {
+    _child_aws_creds
+    [[ -n "${_child_key}" && -n "${_child_secret}" ]] || return 1
+    if [[ -n "${_child_token}" ]]; then
+        AWS_ACCESS_KEY_ID="${_child_key}" AWS_SECRET_ACCESS_KEY="${_child_secret}" AWS_SESSION_TOKEN="${_child_token}" \
+            aws sts get-caller-identity --region "${child_region}" >/dev/null 2>&1
+    else
+        env -u AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID="${_child_key}" AWS_SECRET_ACCESS_KEY="${_child_secret}" \
+            aws sts get-caller-identity --region "${child_region}" >/dev/null 2>&1
+    fi
+}
+
+# Before a delete: push the current (working) credentials so CAPA isn't stuck
+# on expired ones. Best-effort — only when they validate and the identity exists.
+_child_sync_identity() {
+    kubectl -n "${kof_kcm_namespace}" get secret aws-cluster-identity-secret >/dev/null 2>&1 || return 0
+    if _child_creds_valid; then
+        _child_apply_identity_secret && info "Synced the current AWS credentials into the child identity secret." \
+            || warn "Could not update the child identity secret — CAPA may still use expired credentials."
+    else
+        warn "Current AWS credentials are missing/invalid — not syncing the child identity secret."
+    fi
+}
+
+child_apply_identity() {
+    local ns="${kof_kcm_namespace}" i rendered
+
+    info "Applying AWS identity secret in ns ${ns} (from the container's AWS credentials)..."
+    _child_apply_identity_secret || die "Failed to apply secret ${ns}/aws-cluster-identity-secret."
+
+    rendered="$(NS="${ns}" yq '(select(.metadata.namespace != null) | .metadata.namespace) = strenv(NS)' \
+        "${PROJECT_ROOT}/child-cluster/aws-identity.yaml")" || die "Failed to render child-cluster/aws-identity.yaml."
+
+    # AWSClusterStaticIdentity's CRD only appears once CAPA is installed — retry.
+    info "Applying AWSClusterStaticIdentity + Credential..."
+    for (( i = 1; i <= 20; i++ )); do
+        kubectl apply -f - <<<"${rendered}" >/dev/null 2>&1 && break
+        (( i == 20 )) && { kubectl apply -f - <<<"${rendered}"; die "Failed to apply the AWS identity (is CAPA installed?)."; }
+        sleep 15
+    done
+
+    for (( i = 1; i <= 24; i++ )); do
+        if [[ "$(kubectl -n "${ns}" get credential aws-cluster-identity-cred -o jsonpath='{.status.ready}' 2>/dev/null)" == "true" ]]; then
+            info "  Credential aws-cluster-identity-cred ready"
+            return 0
+        fi
+        sleep 5
+    done
+    warn "Credential aws-cluster-identity-cred not reported ready after 2m — continuing."
+}
+
+child_apply_config() {
+    local f
+    f="$(mktemp "${TMPDIR:-/tmp}/mkechildconfig-XXXX.yaml")"
+    NAME="${child_name}" NS="${kof_kcm_namespace}" VER="${child_version}" REGION="${child_region}" \
+    CP="${child_control_plane_count}" W="${child_worker_count}" AZ="${child_az_limit}" yq '
+        .metadata.name = strenv(NAME) |
+        .metadata.namespace = strenv(NS) |
+        .spec.version = strenv(VER) |
+        .spec.infrastructure.controlPlaneNumber = (strenv(CP) | tonumber) |
+        .spec.infrastructure.workersNumber = (strenv(W) | tonumber) |
+        .spec.infrastructure.region = strenv(REGION) |
+        .spec.infrastructure.configuration.network.vpc.availabilityZoneUsageLimit = (strenv(AZ) | tonumber)
+    ' "${PROJECT_ROOT}/child-cluster/mkechildconfig.yaml" > "${f}" \
+        || { rm -f "${f}"; die "Failed to render child-cluster/mkechildconfig.yaml."; }
+    if [[ -n "${child_control_plane_flavor}" ]]; then
+        T="${child_control_plane_flavor}" yq -i '.spec.infrastructure.configuration.controlPlane.instanceType = strenv(T)' "${f}"
+    fi
+    if [[ -n "${child_worker_flavor}" ]]; then
+        T="${child_worker_flavor}" yq -i '.spec.infrastructure.configuration.worker.instanceType = strenv(T)' "${f}"
+    fi
+
+    # SSH. sshKeyName lives in the machine templates and only applies when the
+    # child is created, so an existing child keeps the key it was created with;
+    # the bastion (and its allowed CIDR) can change at any time.
+    local existing key=""
+    [[ "${child_ssh_enabled}" == "true" ]] && key="${cluster_name}-key"
+    existing="$(kubectl -n "${kof_kcm_namespace}" get mkechildconfig "${child_name}" -o json 2>/dev/null || true)"
+    if [[ -n "${existing}" ]]; then
+        local key_have
+        key_have="$(jq -r '.spec.infrastructure.configuration.sshKeyName // ""' <<<"${existing}")"
+        if [[ "${key_have}" != "${key}" ]]; then
+            warn "The child's SSH key is fixed at creation (it has: ${key_have:-none}). To change it,"
+            warn "recreate the child: 't destroy child-cluster' then 't deploy child-cluster'."
+            key="${key_have}"
+        fi
+    fi
+    if [[ -n "${key}" ]]; then
+        K="${key}" yq -i '.spec.infrastructure.configuration.sshKeyName = strenv(K)' "${f}"
+    fi
+    if [[ "${child_ssh_enabled}" == "true" ]]; then
+        CIDR="${_child_cidr}" yq -i '
+            .spec.infrastructure.configuration.publicIP = false |
+            .spec.infrastructure.configuration.bastion = {"enabled": true, "allowedCIDRBlocks": [strenv(CIDR)]}
+        ' "${f}"
+    else
+        yq -i '.spec.infrastructure.configuration.bastion.enabled = false' "${f}"
+    fi
+
+    info "Applying MkeChildConfig/${child_name}..."
+    kubectl apply -f "${f}" || { rm -f "${f}"; die "Failed to apply MkeChildConfig/${child_name}."; }
+    rm -f "${f}"
+}
+
+# JSONPath of an MkeChildConfig printer column (READY / STATUS), from the CRD.
+_child_printer_path() {
+    kubectl get crd "${CHILD_CRD}" -o json 2>/dev/null | jq -r --arg c "$1" '
+        [.spec.versions[] | select(.served) | .additionalPrinterColumns[]?
+         | select((.name | ascii_upcase) == ($c | ascii_upcase)) | .jsonPath][0] // empty'
+}
+
+child_wait_ready() {
+    local ns="${kof_kcm_namespace}" name="${child_name}"
+    local rpath spath to_sec start line ready status last="" next_beat
+    rpath="$(_child_printer_path READY)"
+    spath="$(_child_printer_path STATUS)"
+    [[ -n "${rpath}" ]] || rpath='.status.conditions[?(@.type=="Ready")].status'
+    [[ -n "${spath}" ]] || spath='.status.conditions[?(@.type=="Ready")].message'
+    to_sec="$(_duration_to_seconds "${child_ready_timeout}")"
+    start="${SECONDS}"; next_beat=$(( SECONDS + 120 ))
+
+    info "Waiting for MkeChildConfig/${name} to become Ready (up to ${child_ready_timeout}; typically 12-15 min)..."
+    while (( SECONDS - start < to_sec )); do
+        line="$(kubectl -n "${ns}" get mkechildconfig "${name}" --no-headers \
+            -o "custom-columns=R:{${rpath}},S:{${spath}}" 2>/dev/null || true)"
+        read -r ready status <<<"${line}"
+        if [[ "${ready,,}" == "true" ]]; then
+            info "  [$(fmt_duration $(( SECONDS - start )))] Ready: ${status}"
+            return 0
+        fi
+        if [[ "${status}" != "${last}" || ${SECONDS} -ge ${next_beat} ]]; then
+            echo "  [$(fmt_duration $(( SECONDS - start )))] ready=${ready:-<none>} status=${status:-<none>}"
+            last="${status}"; next_beat=$(( SECONDS + 120 ))
+        fi
+        sleep 15
+    done
+
+    error "MkeChildConfig/${name} not Ready after ${child_ready_timeout}. Debug with:"
+    echo "  kubectl -n ${ns} describe mkechildconfig ${name}"
+    echo "  kubectl -n ${ns} get clusterdeployments,clusters.cluster.x-k8s.io,machines.cluster.x-k8s.io"
+    echo "  Infra not ready (VPC/subnets/ELB/EC2)   -> logs of the capa-* and capi-* pods"
+    echo "  EC2 running but control plane not ready -> logs of the k0smotron pods"
+    echo "  kubectl get pods -A | grep -E 'capa|capi-|k0smotron'"
+    echo "  The child stays in place: re-run 't deploy child-cluster' to keep waiting, or 't destroy child-cluster'."
+    exit 1
+}
+
+# First value of <field> anywhere in the MkeChildConfig (status layout varies
+# between releases; the docs only name the fields).
+_child_status_field() {
+    kubectl -n "${kof_kcm_namespace}" get mkechildconfig "${child_name}" -o json 2>/dev/null \
+        | jq -r --arg f "$1" '[.. | objects | .[$f]? | select(type == "string" and . != "")][0] // empty'
+}
+
+child_fetch_kubeconfig() {
+    local ns="${kof_kcm_namespace}" kc tmp i secret
+    kc="$(child_kubeconfig_file)"
+    tmp="$(mktemp "${TMPDIR:-/tmp}/child-kubeconfig-XXXX")"
+    secret="$(_child_status_field kubeConfigSecret)"
+    secret="${secret:-${child_name}-kubeconfig}"
+    for (( i = 1; i <= 24; i++ )); do
+        kubectl -n "${ns}" get secret "${secret}" -o jsonpath='{.data.value}' 2>/dev/null \
+            | base64 -d > "${tmp}" 2>/dev/null || true
+        [[ -s "${tmp}" ]] && break
+        sleep 5
+    done
+    [[ -s "${tmp}" ]] || { rm -f "${tmp}"; die "Secret ${ns}/${secret} not found or empty."; }
+    install -m 600 "${tmp}" "${kc}"
+    rm -f "${tmp}"
+    info "Child kubeconfig -> ${kc}"
+    kubectl --kubeconfig="${kc}" get nodes -o wide 2>/dev/null \
+        || warn "Child API not reachable yet with ${kc} — retry 't status child' in a minute."
+}
+
+# -- Child Dex admin user ------------------------------------------------------
+# MKE4k creates no Dex admin user on child clusters, so the child UI has no
+# usable login. When child_admin_enabled=true we create one
+# the same way mkectl does on a standalone cluster: a Dex 'Password' object
+# (kubernetes storage, bcrypt hash) on the child, plus the RBAC the management
+# cluster gives its own admin. The plain password only lives in
+# terraform/child_credentials.txt (chmod 600) — Dex stores just the hash.
+CHILD_DEX_NS="mke"
+# Dex's kubernetes storage names a Password object idToName(email) =
+# lowercase unpadded base32 of (email + FNV-64a of empty input). For "admin":
+CHILD_DEX_ADMIN_OBJ="mfsg22lozpzjzzeeeirsk"
+
+child_credentials_file() { printf '%s\n' "${TERRAFORM_DIR}/child_credentials.txt"; }
+
+# htpasswd (apache2-utils) produces the bcrypt hash; install it in the container
+# on demand when missing.
+_child_ensure_htpasswd() {
+    command -v htpasswd >/dev/null 2>&1 && return 0
+    if [[ ${EUID} -eq 0 ]] && command -v apt-get >/dev/null 2>&1; then
+        info "Installing apache2-utils (htpasswd, for the bcrypt hash)..."
+        apt-get update -qq >/dev/null 2>&1 \
+            && apt-get install -y -qq --no-install-recommends apache2-utils >/dev/null 2>&1 \
+            && return 0
+    fi
+    return 1
+}
+
+# Copy the management cluster's ClusterRoleBindings for its Dex admin onto the
+# child. Only the admin subjects are copied, into bindings with our own name
+# prefix, so no existing child binding is modified.
+# Usage: child_admin_rbac <child-kubeconfig> <admin-userID>
+child_admin_rbac() {
+    local kc="$1" uid="$2" bindings n role
+    bindings="$(kubectl get clusterrolebindings -o json 2>/dev/null | jq -c --arg uid "${uid}" '
+        def adm: .kind == "User" and (.name == "admin" or (.name | endswith(":admin"))
+                                      or ($uid != "" and (.name | contains($uid))));
+        [.items[] | select(any(.subjects[]?; adm))
+         | {apiVersion: "rbac.authorization.k8s.io/v1", kind: "ClusterRoleBinding",
+            metadata: {name: ("mke4k-lab-child-admin-" + .metadata.name),
+                       labels: {"app.kubernetes.io/managed-by": "mke4k-lab"}},
+            roleRef: .roleRef, subjects: [.subjects[] | select(adm)]}]')" || bindings="[]"
+    n="$(jq length <<<"${bindings:-[]}" 2>/dev/null || echo 0)"
+    if (( n == 0 )); then
+        warn "No ClusterRoleBinding for the Dex admin found on the management cluster —"
+        warn "binding cluster-admin to User 'admin' on the child (may not match its OIDC username claim)."
+        bindings='[{"apiVersion":"rbac.authorization.k8s.io/v1","kind":"ClusterRoleBinding","metadata":{"name":"mke4k-lab-child-admin","labels":{"app.kubernetes.io/managed-by":"mke4k-lab"}},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"cluster-admin"},"subjects":[{"apiGroup":"rbac.authorization.k8s.io","kind":"User","name":"admin"}]}]'
+    fi
+    jq '{apiVersion: "v1", kind: "List", items: .}' <<<"${bindings}" \
+        | kubectl --kubeconfig="${kc}" apply -f - >/dev/null || return 1
+    info "  RBAC: $(jq -r '[.[] | "\(.roleRef.name) -> \([.subjects[].name] | join(","))"] | join("; ")' <<<"${bindings}")"
+    for role in $(jq -r '.[] | select(.roleRef.kind == "ClusterRole") | .roleRef.name' <<<"${bindings}"); do
+        kubectl --kubeconfig="${kc}" get clusterrole "${role}" >/dev/null 2>&1 \
+            || warn "  ClusterRole ${role} does not exist on the child — that binding grants nothing."
+    done
+}
+
+child_create_admin_user() {
+    [[ "${child_admin_enabled}" == "true" ]] || return 0
+    local kc creds ns="${CHILD_DEX_NS}" uid="" pass hash i
+    kc="$(child_kubeconfig_file)"; creds="$(child_credentials_file)"
+
+    info "Creating the child's Dex admin user (none is created on child clusters by default)..."
+    for (( i = 1; i <= 30; i++ )); do
+        kubectl --kubeconfig="${kc}" get crd passwords.dex.coreos.com >/dev/null 2>&1 && break
+        if (( i == 30 )); then
+            warn "Dex Passwords CRD not present on the child after 5m — skipping the admin user."
+            return 0
+        fi
+        sleep 10
+    done
+
+    if kubectl --kubeconfig="${kc}" -n "${ns}" get password "${CHILD_DEX_ADMIN_OBJ}" >/dev/null 2>&1; then
+        uid="$(kubectl --kubeconfig="${kc}" -n "${ns}" get password "${CHILD_DEX_ADMIN_OBJ}" -o jsonpath='{.userID}' 2>/dev/null || true)"
+        if [[ -f "${creds}" ]]; then
+            info "  admin user already exists (password in $(basename "${creds}"))"
+        else
+            warn "  An admin user already exists on the child but wasn't created by t, so its password is unknown."
+            warn "  To regenerate: kubectl --kubeconfig ${kc} -n ${ns} delete password ${CHILD_DEX_ADMIN_OBJ}; t deploy child-cluster"
+        fi
+    else
+        _child_ensure_htpasswd \
+            || { warn "htpasswd not found (apt-get install apache2-utils) — skipping the child admin user."; return 0; }
+        # Reuse the management admin's userID so copied RBAC subjects that embed it stay valid.
+        uid="$(kubectl -n "${ns}" get password "${CHILD_DEX_ADMIN_OBJ}" -o jsonpath='{.userID}' 2>/dev/null || true)"
+        [[ -n "${uid}" ]] || uid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]')"
+        pass="$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 20)"
+        # Password on stdin (-i), not in argv.
+        hash="$(printf '%s' "${pass}" | htpasswd -niBC 10 '' | tr -d ':\n')"
+        [[ "${hash}" == \$2* ]] || { warn "bcrypt hashing failed — skipping the child admin user."; return 0; }
+        # Dex's kubernetes storage keeps the hash as []byte, i.e. base64 in the object.
+        kubectl --kubeconfig="${kc}" apply -f - >/dev/null <<EOF || { warn "Failed to create the child Dex admin user."; return 0; }
+apiVersion: dex.coreos.com/v1
+kind: Password
+metadata:
+  name: ${CHILD_DEX_ADMIN_OBJ}
+  namespace: ${ns}
+email: admin
+username: admin
+userID: ${uid}
+hash: $(printf '%s' "${hash}" | base64 | tr -d '\n')
+EOF
+        ( umask 077; printf 'username=admin\npassword=%s\n' "${pass}" > "${creds}" )
+        info "  admin user created -> $(basename "${creds}")"
+    fi
+    child_admin_rbac "${kc}" "${uid}" || warn "Failed to apply the child admin RBAC."
+}
+
+# With SSH enabled, wait (best-effort) for CAPA to report the bastion's public IP.
+child_wait_bastion() {
+    [[ "${child_ssh_enabled}" == "true" ]] || return 0
+    local i
+    info "Waiting for the child bastion's public IP..."
+    for (( i = 1; i <= 30; i++ )); do
+        [[ -n "$(_child_bastion_ip)" ]] && { info "  bastion: $(_child_bastion_ip)"; return 0; }
+        sleep 10
+    done
+    warn "Child bastion has no public IP after 5m — check 'kubectl -n ${kof_kcm_namespace} get awscluster -o yaml' (.status.bastion)."
+}
+
+print_child_cluster_summary() {
+    local kc; kc="$(child_kubeconfig_file)"
+    echo ""
+    echo -e "${BOLD}Child cluster: ${child_name}${RESET}  (region ${child_region}, version ${child_version})"
+    kubectl -n "${kof_kcm_namespace}" get mkechildconfig "${child_name}" -o wide 2>/dev/null | sed 's/^/  /' || true
+    local addr creds; addr="$(_child_status_field externalAddress)"; creds="$(child_credentials_file)"
+    [[ -n "${addr}" ]] && echo "  UI:         ${addr}"
+    if [[ -f "${creds}" ]]; then
+        echo "  UI login:   $(grep '^username=' "${creds}" | cut -d= -f2) / $(grep '^password=' "${creds}" | cut -d= -f2)   (${creds})"
+    fi
+    echo "  Kubeconfig: ${kc}"
+    local bip; bip="$(_child_bastion_ip)"
+    if [[ -n "${bip}" ]]; then
+        echo "  SSH:        t connect m1-child | w1-child | child-bastion   (bastion ${bip})"
+    fi
+    echo "  Nodes:      t status child   (or KUBECONFIG=${kc} kubectl get nodes)"
+    echo "  Delete:     t destroy child-cluster   ('t destroy lab' does this first automatically)"
+    echo ""
+}
+
+cmd_deploy_child_cluster() {
+    load_config
+    child_preflight
+    info "Child cluster ${child_name}: ${child_control_plane_count} control plane / ${child_worker_count} worker(s), region=${child_region}, version=${child_version}"
+    local start="${SECONDS}"
+    child_enable_providers
+    child_apply_identity
+    child_apply_config
+    # Written as soon as the child exists in AWS, so 't destroy lab' knows about
+    # it even if the wait below fails or the management cluster later goes away.
+    printf '%s\n' "${child_name}" > "$(child_marker_file)"
+    child_wait_ready
+    child_fetch_kubeconfig
+    child_wait_bastion
+    child_create_admin_user
+    print_child_cluster_summary
+    if (( expiry_days > 0 )); then
+        warn "Auto-expiry does NOT cover the child cluster: if the lab expires, its CAPA resources"
+        warn "(VPC, NAT GW, ELB, EC2) stay in AWS. Run 't destroy child-cluster' or 't destroy lab' first."
+    fi
+    success "Child cluster ${child_name} ready ($(fmt_duration $(( SECONDS - start ))))."
+}
+
+# Prints the child's remaining objects (one per kind) or "?" when the API
+# can't be queried — callers must not treat an API error as "gone".
+_child_remaining() {
+    local name="$1" ns="${kof_kcm_namespace}" out kind
+    local -a left=()
+    out="$(kubectl -n "${ns}" get mkechildconfig "${name}" --ignore-not-found -o name 2>/dev/null)" || { echo "?"; return; }
+    [[ -n "${out}" ]] && left+=("${out}")
+    for kind in clusterdeployments.k0rdent.mirantis.com clusters.cluster.x-k8s.io; do
+        out="$(kubectl -n "${ns}" get "${kind}" -o name 2>/dev/null)" || { echo "?"; return; }
+        out="$(grep -E "/${name}(-|$)" <<<"${out}" || true)"
+        [[ -n "${out}" ]] && left+=(${out})
+    done
+    echo "${left[*]}"
+}
+
+# Delete one child and wait until k0rdent/CAPI have removed it (CAPA tears
+# down its AWS resources before the CAPI Cluster object goes). Returns 1 on timeout.
+_child_delete() {
+    local name="$1" ns="${kof_kcm_namespace}" to_sec start left next_beat vpcs
+    to_sec="$(_duration_to_seconds "${child_delete_timeout}")"
+    _child_sync_identity
+    info "Deleting child cluster ${name} (CAPA removes its VPC/ELB/EC2; up to ${child_delete_timeout})..."
+    kubectl -n "${ns}" delete mkechildconfig "${name}" --wait=false >/dev/null 2>&1 || true
+    start="${SECONDS}"; next_beat="${SECONDS}"
+    while (( SECONDS - start < to_sec )); do
+        left="$(_child_remaining "${name}")"
+        if [[ -z "${left}" ]]; then
+            info "  [$(fmt_duration $(( SECONDS - start )))] ${name}: all k0rdent/CAPI objects gone"
+            vpcs="$(_child_capa_vpcs)"
+            [[ -z "${vpcs}" ]] || warn "CAPA VPC(s) still present for ${name}: ${vpcs} — check the AWS console (tag ${CHILD_CAPA_TAG_PREFIX}/${name})."
+            return 0
+        fi
+        if (( SECONDS >= next_beat )); then
+            echo "  [$(fmt_duration $(( SECONDS - start )))] still deleting: ${left}"
+            next_beat=$(( SECONDS + 60 ))
+        fi
+        sleep 15
+    done
+    error "Child cluster ${name} not deleted after ${child_delete_timeout} (remaining: ${left})."
+    echo "  kubectl -n ${ns} get clusters.cluster.x-k8s.io,awsclusters -o wide; logs of the capa-* pods" >&2
+    return 1
+}
+
+cmd_destroy_child_cluster() {
+    load_config
+    local ns="${kof_kcm_namespace}"
+    _child_lab_supported "$(tf_output 2>/dev/null || true)" \
+        || die "Child clusters are only supported on an online MKE4k lab."
+    kubectl get nodes --request-timeout=20s >/dev/null 2>&1 || die "Cluster not reachable."
+    if kubectl get crd "${CHILD_CRD}" >/dev/null 2>&1 \
+        && kubectl -n "${ns}" get mkechildconfig "${child_name}" >/dev/null 2>&1; then
+        _child_delete "${child_name}" || die "Child cluster deletion did not finish — re-run 't destroy child-cluster'."
+    else
+        info "MkeChildConfig ${ns}/${child_name} not found — nothing to delete."
+    fi
+    rm -f "$(child_marker_file)" "$(child_kubeconfig_file)" "$(child_credentials_file)"
+    success "Child cluster removed."
+}
+
+# Called by 't destroy lab' / 't destroy cluster' BEFORE tearing down the
+# management cluster: deletes every MkeChildConfig so CAPA can still remove
+# the children's AWS resources. Dies rather than orphan them.
+# T_SKIP_CHILD=1 skips the check.
+child_destroy_before_teardown() {
+    local ns="${kof_kcm_namespace}" marker output names n
+    marker="$(child_marker_file)"
+    if [[ "${T_SKIP_CHILD:-}" == "1" ]]; then
+        warn "T_SKIP_CHILD=1: not deleting child clusters — their CAPA resources (VPC/ELB/EC2) stay in AWS."
+        return 0
+    fi
+    output="$(tf_output 2>/dev/null || true)"
+    _child_lab_supported "${output}" || return 0
+
+    if [[ -f "${KUBECONFIG}" ]] && kubectl get nodes --request-timeout=20s >/dev/null 2>&1; then
+        if ! kubectl get crd "${CHILD_CRD}" >/dev/null 2>&1; then
+            rm -f "${marker}"
+            return 0
+        fi
+        names="$(kubectl -n "${ns}" get mkechildconfig -o jsonpath='{.items[*].metadata.name}')" \
+            || die "Could not list MkeChildConfigs in ${ns}. Re-run, or set T_SKIP_CHILD=1 to skip (child AWS resources would be orphaned)."
+        if [[ -n "${names}" ]]; then
+            info "Child cluster(s) found: ${names} — deleting them first so CAPA can remove their AWS resources."
+            for n in ${names}; do
+                _child_delete "${n}" \
+                    || die "Child cluster ${n} was not deleted. Fix and re-run, or set T_SKIP_CHILD=1 to skip (its AWS resources would be orphaned)."
+            done
+        fi
+        rm -f "${marker}" "$(child_kubeconfig_file)" "$(child_credentials_file)"
+    elif [[ -f "${marker}" ]]; then
+        die "A child cluster ($(cat "${marker}")) was deployed, but the management cluster is unreachable, so CAPA can't delete it.
+       Restore access and re-run, or set T_SKIP_CHILD=1 and remove its AWS resources by hand
+       (tag ${CHILD_CAPA_TAG_PREFIX}/$(cat "${marker}"), region ${child_region})."
+    fi
+}
+
+# 't rotate child-creds': export fresh AWS credentials, then push them into the
+# CAPA identity secret (e.g. after temporary session credentials expired).
+cmd_rotate_child_creds() {
+    load_config
+    _child_lab_supported "$(tf_output 2>/dev/null || true)" \
+        || die "Child clusters are only supported on an online MKE4k lab."
+    kubectl get nodes --request-timeout=20s >/dev/null 2>&1 || die "Cluster not reachable."
+    kubectl -n "${kof_kcm_namespace}" get secret aws-cluster-identity-secret >/dev/null 2>&1 \
+        || die "No child identity secret in ${kof_kcm_namespace} — run 't deploy child-cluster' first."
+    _child_aws_creds
+    [[ -n "${_child_key}" && -n "${_child_secret}" ]] \
+        || die "AWS credentials not set. Export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY[/AWS_SESSION_TOKEN] (or CHILD_AWS_*)."
+    _child_creds_valid || die "The exported AWS credentials are rejected by AWS (sts get-caller-identity) — not rotating."
+    _child_apply_identity_secret || die "Failed to update ${kof_kcm_namespace}/aws-cluster-identity-secret."
+    [[ -n "${_child_token}" ]] && warn "These are temporary credentials too — rotate again before they expire."
+    success "Child identity secret updated; CAPA uses the new credentials on its next reconcile."
+}
+
+cmd_status_child() {
+    load_config
+    local kc; kc="$(child_kubeconfig_file)"
+    [[ -f "${kc}" ]] || die "Child kubeconfig not found at ${kc}. Run 't deploy child-cluster' first."
+    kubectl -n "${kof_kcm_namespace}" get mkechildconfig "${child_name}" 2>/dev/null || true
+    info "Child cluster node status:"
+    kubectl --kubeconfig="${kc}" get nodes -o wide
+}
+
+# ---------------------------------------------------------------------------
 # MSR4 (Harbor) deployment — k0rdent ServiceTemplate based
 # ---------------------------------------------------------------------------
 # Exposed as NodePort 33443 (inside MKE4k default nodePortRange 32768-35535).
@@ -6821,21 +7654,26 @@ usage() {
     echo "  deploy kof [full|lean]      Deploy KOF observability/FinOps (self-monitoring; default kof_mode)"
     echo "  deploy kof [full|lean] airgap  Deploy KOF from the bastion (charts/images from the internal registry)"
     echo "  deploy k0rdent-ui           Rotate the k0rdent UI password + publish it via Envoy gateway"
+    echo "  deploy child-cluster        MKE4k child cluster via k0rdent/CAPI on AWS (online MKE4k; child_* in config)"
     echo "  destroy cluster             Uninstall MKE4k (mkectl reset)"
     echo "  destroy cluster mke3        Uninstall MKE3 (launchpad reset)"
     echo "  destroy cluster airgap      Uninstall MKE4k from bastion"
     echo "  destroy cluster mke3-airgap Uninstall MKE3 from bastion"
     echo "  destroy kof                 Uninstall KOF (helm uninstall + delete ns kof)"
     echo "  destroy k0rdent-ui          Remove the k0rdent UI gateway resources"
-    echo "  destroy lab                 Destroy all AWS infrastructure (terraform destroy)"
+    echo "  destroy child-cluster       Delete the child cluster (CAPA removes its AWS resources)"
+    echo "  rotate child-creds          Push freshly exported AWS credentials into the child's CAPA identity"
+    echo "  destroy lab                 Delete any child cluster, then all AWS infrastructure (terraform destroy)"
     echo "  expiry [<days>|off|show]    Show/change/disable auto-expiry (re-arms to now+<days>; targeted apply)"
     echo "  status                      Show cluster node status (kubectl get nodes)"
+    echo "  status child                Show child cluster status + nodes"
     echo "  show nodes                  Print controller/worker IPs and load balancer DNS"
     echo "  show summary                Reprint the deploy summary box (credentials, URLs, IPs)"
     echo "  connect bastion             SSH to bastion/registry host (airgap)"
     echo "  connect nfs                 SSH to NFS server (when nfs_enabled=true)"
     echo "  connect <node>              SSH into a node (m1/m2/m3, w1/w2/w3, or raw IP)"
     echo "  connect <node> cmd          Run a single command on a node and return"
+    echo "  connect m1-child|w1-child   SSH into a child cluster node via its bastion (child_ssh_enabled=true)"
     echo "  gen client-bundle [mke3]    Download MKE3 client bundle (default)"
     echo "  gen client-bundle mke4      Show MKE4k kubeconfig path"
     echo "  config get [mke4|mke3]      Pull the running cluster config to a local file"
@@ -6928,7 +7766,8 @@ case "${COMMAND}" in
                 esac
                 ;;
             k0rdent-ui) cmd_deploy_k0rdent_ui ;;
-            *)         die "Unknown subcommand: t deploy ${SUBCOMMAND}. Try: lab, instances, cluster, registry, nfs, msr4, kof, k0rdent-ui" ;;
+            child-cluster) cmd_deploy_child_cluster ;;
+            *)         die "Unknown subcommand: t deploy ${SUBCOMMAND}. Try: lab, instances, cluster, registry, nfs, msr4, kof, k0rdent-ui, child-cluster" ;;
         esac
         ;;
     destroy)
@@ -6945,10 +7784,17 @@ case "${COMMAND}" in
                 ;;
             kof)     cmd_destroy_kof ;;
             k0rdent-ui) cmd_destroy_k0rdent_ui ;;
-            *)       die "Unknown subcommand: t destroy ${SUBCOMMAND}. Try: lab, cluster, kof, k0rdent-ui" ;;
+            child-cluster) cmd_destroy_child_cluster ;;
+            *)       die "Unknown subcommand: t destroy ${SUBCOMMAND}. Try: lab, cluster, kof, k0rdent-ui, child-cluster" ;;
         esac
         ;;
-    status)    cmd_status ;;
+    status)
+        case "${SUBCOMMAND}" in
+            "")    cmd_status ;;
+            child) cmd_status_child ;;
+            *)     die "Unknown subcommand: t status ${SUBCOMMAND}. Try: (empty), child" ;;
+        esac
+        ;;
     expiry)    cmd_expiry "${SUBCOMMAND}" ;;
     show)
         case "${SUBCOMMAND}" in
@@ -6958,6 +7804,12 @@ case "${COMMAND}" in
         esac
         ;;
     connect) cmd_connect "${SUBCOMMAND}" "${3:-}" ;;
+    rotate)
+        case "${SUBCOMMAND}" in
+            child-creds) cmd_rotate_child_creds ;;
+            *)           die "Unknown subcommand: t rotate ${SUBCOMMAND}. Try: child-creds" ;;
+        esac
+        ;;
     gen)
         case "${SUBCOMMAND}" in
             client-bundle) cmd_gen_client_bundle "${3:-mke3}" ;;

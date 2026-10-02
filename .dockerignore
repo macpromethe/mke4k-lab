@@ -2,6 +2,9 @@
 .owner
 .expiry-days
 .expiry-base
+.child-cluster
+terraform/child.kubeconfig
+terraform/child_credentials.txt
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/.terraform/

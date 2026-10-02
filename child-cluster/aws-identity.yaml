@@ -1,0 +1,38 @@
+# AWS identity for MKE4k child clusters (CAPA), as in
+# https://docs.mirantis.com/mke4/4.2.0/tutorials/deploy-mke4-child-cluster/aws/
+# Applied by 't deploy child-cluster' into the k0rdent (KCM) namespace;
+# the namespace is substituted at render time. The referenced Secret
+# 'aws-cluster-identity-secret' (AccessKeyID/SecretAccessKey) is NOT in this file:
+# it is built in-memory from the container's AWS credentials so keys never land on disk.
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: AWSClusterStaticIdentity
+metadata:
+  name: aws-cluster-identity
+  labels:
+    k0rdent.mirantis.com/component: "kcm"
+spec:
+  secretRef: aws-cluster-identity-secret
+  allowedNamespaces: {}
+---
+apiVersion: k0rdent.mirantis.com/v1beta1
+kind: Credential
+metadata:
+  name: aws-cluster-identity-cred
+  namespace: k0rdent
+spec:
+  description: "AWS Credential"
+  identityRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+    kind: AWSClusterStaticIdentity
+    name: aws-cluster-identity
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aws-cluster-identity-resource-template
+  namespace: k0rdent
+  labels:
+    k0rdent.mirantis.com/component: "kcm"
+  annotations:
+    projectsveltos.io/template: "true"

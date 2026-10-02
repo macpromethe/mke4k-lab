@@ -38,6 +38,21 @@ mke4k_version="v4.2.0"
 # false -> run 't deploy k0rdent-ui' once the cluster is already deployed
 k0rdent_ui_enabled=false
 
+# -- MKE4k child cluster (t deploy child-cluster / t destroy child-cluster) --
+# Online MKE4k only. Run once the lab is up; k0rdent provisions the child via
+# CAPI (AWS) as '<cluster_name>-child', in its own VPC, using the container's
+# AWS credentials. 't destroy lab' deletes the child first.
+# NOTE: auto-expiry does NOT cover the child - destroy it before the lab expires.
+child_control_plane_count=1
+child_worker_count=1
+# true -> create a Dex 'admin' login for the child UI (none is created by default);
+#         password -> terraform/child_credentials.txt, RBAC copied from this cluster's admin.
+child_admin_enabled=true
+# true -> SSH into child nodes ('t connect m1-child' / 'w1-child') through a CAPA
+#         bastion locked to your public IP (nodes stay private). Must be set
+#         BEFORE 't deploy child-cluster': the SSH key can't be added to a running child.
+child_ssh_enabled=false
+
 # -- MKE3 (t deploy lab mke3) --
 mke3_version="3.8.2"
 mcr_version="25.0.14"
@@ -133,6 +148,24 @@ expiry_dry_run=false
 k0rdent_ui_nodeport=33003
 # NLB listener port. Online: https://<nlb-dns>:<lb_port>. Airgap: t tunnel k0rdent-ui.
 k0rdent_ui_lb_port=8445
+
+# -- MKE4k child cluster (used by 't deploy child-cluster') --
+# AWS region for the child (empty = same as 'region').
+child_region=""
+# EC2 instance types (empty = the mke4k-aws cluster template's defaults:
+# m5.xlarge control plane / m5.large workers). Rendered into
+# spec.infrastructure.configuration.{controlPlane,worker}.instanceType.
+# The child's MKE4k version always equals mke4k_version (must match the management cluster).
+child_control_plane_flavor=""
+child_worker_flavor=""
+# Max availability zones the child's CAPA VPC spans.
+child_az_limit=1
+# CIDR allowed to SSH to the child bastion (empty = this host's public IP/32,
+# auto-detected; re-run 't deploy child-cluster' after your IP changes).
+child_ssh_allowed_cidr=""
+# How long to wait for the child to become Ready / to be deleted (s|m|h).
+child_ready_timeout="30m"
+child_delete_timeout="30m"
 
 # -- MKE3 --
 # launchpad binary is auto-downloaded on first use.

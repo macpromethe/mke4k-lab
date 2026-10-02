@@ -1,0 +1,26 @@
+# MKE4k child cluster skeleton (docs.mirantis.com/mke4/4.2.0/tutorials/deploy-mke4-child-cluster/aws/).
+# 't deploy child-cluster' fills name, namespace, version, counts, region and AZ
+# limit from the child_* settings in 'config' (version = mke4k_version, which must
+# match the management cluster's).
+apiVersion: mke.mirantis.com/v1alpha1
+kind: MkeChildConfig
+metadata:
+  name: CHILD_NAME
+  namespace: k0rdent
+spec:
+  version: CHILD_VERSION
+  registries:
+    chartRegistry:
+      url: oci://registry.mirantis.com/mke
+    imageRegistry:
+      url: registry.mirantis.com/mke
+  infrastructure:
+    provider: aws
+    credential: aws-cluster-identity-cred
+    region: CHILD_REGION
+    controlPlaneNumber: 1
+    workersNumber: 1
+    configuration:
+      network:
+        vpc:
+          availabilityZoneUsageLimit: 1

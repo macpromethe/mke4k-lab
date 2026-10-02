@@ -83,6 +83,7 @@ RUN apt-get update && \
         jq \
         tmux \
         less \
+        apache2-utils \
         python3 && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
