@@ -38,6 +38,7 @@ mke3/
 Dockerfile
 CLAUDE.md
 README.md
+docs/
 kof/MKE4-INTEGRATION.md
 kof/INSTALL-MKE.md
 kof/KOF-RUNBOOK.md
