@@ -18,7 +18,25 @@ resource "aws_instance" "cluster-controller" {
     preserve_hostname: false
     prefer_fqdn_over_hostname: true
     manage_etc_hosts: localhost
+    # Raise the inotify limits (kernel default: 128 instances per user). A lab
+    # node runs MKE4k + k0rdent + CAPI controllers that each hold watchers; at
+    # the default, the kubelet can't open one for 'kubectl logs -f' ("failed to
+    # create fsnotify watcher: too many open files"). write_files lands after
+    # systemd-sysctl on first boot, hence the runcmd; later boots apply the file.
+    write_files:
+      - path: /etc/sysctl.d/99-mke4k-lab-inotify.conf
+        content: |
+          fs.inotify.max_user_instances = 8192
+          fs.inotify.max_user_watches = 524288
+    runcmd:
+      - [sysctl, --system]
   EOF
+
+  # user_data only runs at first boot, and the AWS provider would stop/start a
+  # running instance to change it — keep live labs untouched.
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 
   root_block_device {
     volume_size = 50
