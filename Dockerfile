@@ -4,9 +4,16 @@ FROM --platform=linux/amd64 ubuntu:22.04 AS builder
 ARG DEBIAN_FRONTEND=noninteractive
 WORKDIR /build
 
-ENV KUBECTL_VERSION=v1.32.5 \
+# kubectl tracks the Kubernetes version MKE ships: MKE 4.2.x ships k0s v1.35.x,
+# and a k0s version string is the Kubernetes version. kubectl supports one minor
+# of skew either way; beyond that it mostly works and then fails oddly on newer
+# API shapes.
+#
+# Terraform tracks a current release; 1.8.4 is well behind (e.g. it predates S3
+# native state locking via use_lockfile, which needs 1.10+).
+ENV KUBECTL_VERSION=v1.35.8 \
     HELM_VERSION=v3.18.3 \
-    TERRAFORM_VERSION=1.8.4 \
+    TERRAFORM_VERSION=1.16.3 \
     K9S_VERSION=0.50.6 \
     YQ_VERSION=v4.45.1 \
     PATH=/usr/local/bin:$PATH
